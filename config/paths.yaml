@@ -1,0 +1,17 @@
+root: /Users/brenden/Desktop/aversive-attributes
+
+code: code
+notebooks: notebooks
+
+data:
+  processed: data/processed
+
+results:
+  cache: results/cache
+  figures: results/figures
+  tables: results/tables
+  temp: results/temp
+
+paper_figures: paper/figures
+paper_tables: paper/tables
+paper_text: paper/text_output

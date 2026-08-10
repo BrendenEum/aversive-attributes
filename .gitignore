@@ -1,0 +1,73 @@
+###########################
+# Folders
+###########################
+
+# Real Folders
+
+archive/
+notebooks/archive/
+notebooks/notebook_figures/
+paper/
+results/cache/
+results/logs/
+results/temp/
+
+# Symlink Folders (you don't need this, but just in case)
+
+admin/
+data/
+docs/
+experiments/
+presentations/
+
+
+###########################
+# Code Stuff
+###########################
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# R
+.Rhistory
+.RData
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
+
+
+###########################
+# Models
+###########################
+
+*.pt
+*.pth
+*.ckpt
+
+# R model fits and analysis caches (too large for GitHub)
+*.rds
+*.rdb
+notebooks/brm_fits/
+notebooks/PAS3_Analysis_cache/
+notebooks/PAS4_Analysis_cache/
+*.h5
+*.pkl
+*.pickle
+*.joblib
+
+
+###########################
+# Large files
+###########################
+
+*.zip
+*.tar
+*.gz
+*.csv
+*.parquet
+*.feather

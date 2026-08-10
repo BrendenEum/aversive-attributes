@@ -1,0 +1,667 @@
+---
+title: "PAS3 Analysis"
+author: "Brenden Eum"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+    theme: flatly
+---
+
+Correlational analysis of the relationship between attention and
+choice in a 2-attribute binary choice task where attributes can be positive (P),
+negative (N), or ambivalent (B).
+
+Main Goals:
+
+1. Characterize how attention is allocated across attributes and values.
+
+2. Characterize how attention relates to choice, and whether this relationship flips
+   for negative attributes.
+
+3. Test whether choice sensitivity to value is range-normalized.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  cache = TRUE,
+  autodep = TRUE,
+  fig.width = 8,
+  fig.height = 5,
+  dpi = 120
+)
+```
+
+# Preamble
+
+```{r libraries}
+library(tidyverse)
+library(glmmTMB)
+library(lme4)
+library(brms)
+library(bayestestR)
+library(patchwork)
+
+# ── Plot style (mirrors Cambridge notebook conventions) ───────────────────────
+plt <- list(
+  # Rotman color palette
+  orange = "#FCAF17",
+  peach  = "#F17184",
+  pink   = "#E20778",
+  navy   = "#004990",
+  blue   = "#3E77B7",
+  cyan   = "#41C3DC",
+  green  = "#09AD87",
+  marsh  = "#B6CD2D",
+
+  # Experiment-specific named color scales (pass directly to scale_*_manual)
+  type_colors = c("P" = "#004990", "N" = "#E20778", "B" = "#FCAF17"),
+  wn_colors   = c("Narrow" = "#09AD87", "Wide" = "#3E77B7"),
+  bpn_colors  = c("PN" = "#004990", "PB" = "#FCAF17", "NB" = "#E20778"),
+  box_colors  = c("LT" = "#004990", "LB" = "#3E77B7",
+                  "RT" = "#E20778", "RB" = "#F17184"),
+
+  # Base theme: applied globally via theme_set(); add `+ plt$theme` for
+  # per-plot overrides (e.g. to change legend.position).
+  theme = theme_bw(base_size = 14) + theme(
+    strip.text       = element_text(face = "bold", size = 12),
+    strip.background = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+)
+
+theme_set(plt$theme)
+
+# brms sampling settings. Uses the cmdstanr backend (faster than rstan).
+options(mc.cores = parallel::detectCores())
+options(brms.backend = "cmdstanr")
+BRMS_CHAINS <- 4
+BRMS_ITER   <- 2000
+BRMS_SEED   <- 1234
+
+# Where the fitted brms models are cached. Re-running the notebook reloads them
+# instead of refitting. Delete these .rds files to force a refit.
+dir.create("brm_fits", showWarnings = FALSE)
+```
+
+```{r data-paths}
+paths    <- yaml::yaml.load_file(here::here("config/paths.yaml"))
+data_dir <- file.path(paths$root, paths$data$processed)
+
+pas_raw  <- read_csv(file.path(data_dir, "PAS3.csv"),     show_col_types = FALSE)
+long_raw <- read_csv(file.path(data_dir, "PAS3long.csv"), show_col_types = FALSE)
+```
+
+---
+
+# Data Cleaning
+
+```{r clean-trial}
+pas <- pas_raw %>%
+  mutate(
+    Subject = factor(SubjectNumber),
+    WN  = factor(WN, levels = c("Narrow", "Wide")), # Narrow is the reference
+    BPN = factor(BPN, levels = c("PN", "PB", "NB")),
+    ChooseL = as.integer(ChooseL), # logical -> 0/1
+    Correct = as.integer(Correct),
+    Difficulty = abs(Diff),
+    Diff_z = as.numeric(scale(Diff)), # scaled for brms sampling
+    # Normalized net fixation: relative attention to left, 
+    # free of total deliberation time (which is essentially RT). Guard against zero totals.
+    total_dwell = DwellL + DwellR, 
+    DwellDiff_norm = if_else(total_dwell > 0, DwellDiff / total_dwell, 0)
+  )
+
+# Refined trial type from realized B valence. The B attribute lives in whichever
+# row is labelled "B". Identify its left and right values, then classify.
+pas <- pas %>%
+  mutate(
+    B_left  = case_when(AttT == "B" ~ VLT, AttB == "B" ~ VLB, TRUE ~ NA_real_),
+    B_right = case_when(AttT == "B" ~ VRT, AttB == "B" ~ VRB, TRUE ~ NA_real_),
+    B_valence = case_when(
+      is.na(B_left)            ~ "none",    # PN trials
+      B_left > 0 & B_right > 0 ~ "pos",     # both B positive
+      B_left < 0 & B_right < 0 ~ "neg",     # both B negative
+      TRUE                     ~ "mixed"    # B switches sign across options
+    ),
+    BPN_refined = case_when(
+      BPN == "PN"                      ~ "PN",
+      BPN == "PB" & B_valence=="pos"   ~ "PB+",
+      BPN == "PB" & B_valence=="neg"   ~ "PB-",
+      BPN == "PB" & B_valence=="mixed" ~ "PBo",
+      BPN == "NB" & B_valence=="pos"   ~ "NB+",
+      BPN == "NB" & B_valence=="neg"   ~ "NB-",
+      BPN == "NB" & B_valence=="mixed" ~ "NBo"
+    ),
+    mixedB = B_valence == "mixed"
+  )
+
+table(pas$BPN_refined, useNA = "ifany")
+```
+
+## Per-box long representation
+
+Left boxes get a side sign of `+1` (looking there should move choice toward "left"); right boxes get `-1`.
+
+```{r boxlong}
+mk_box <- function(df, box, side_sign, type_col, val_col, dwell_col) {
+  df %>%
+    transmute(
+      Subject, Trial, WN, BPN, ChooseL, Diff, Diff_z,
+      box       = box,
+      side_sign = side_sign,
+      type      = .data[[type_col]],
+      value     = .data[[val_col]],
+      dwell     = .data[[dwell_col]]
+    )
+}
+
+boxlong <- bind_rows(
+  mk_box(pas, "LT",  1, "AttT", "VLT", "DwellLT"),
+  mk_box(pas, "LB",  1, "AttB", "VLB", "DwellLB"),
+  mk_box(pas, "RT", -1, "AttT", "VRT", "DwellRT"),
+  mk_box(pas, "RB", -1, "AttB", "VRB", "DwellRB")
+) %>%
+  mutate(
+    type = factor(type, levels = c("P", "N", "B")),
+    # Signed dwell: positive seconds push choice toward this box's side.
+    signed_dwell = side_sign * dwell,
+    # Signed value: this box's value, signed by side. Scaled for brms sampling.
+    signed_value = side_sign * value / 10,
+    # Cell label for (type x value), e.g. "N_neg10", "P_pos5", "B_pos20".
+    cell = paste0(type, "_", if_else(value < 0, "neg", "pos"), abs(value))
+  )
+
+glimpse(boxlong)
+```
+
+## Fixation-level cleaning
+
+```{r clean-long}
+long <- long_raw %>%
+  mutate(
+    Subject = factor(SubjectNumber),
+    WN  = factor(WN,  levels = c("Narrow", "Wide")),
+    BPN = factor(BPN, levels = c("PN", "PB", "NB")),
+    fix_value = case_when(
+      FixROI == "LT" ~ VLT, FixROI == "RT" ~ VRT,
+      FixROI == "LB" ~ VLB, FixROI == "RB" ~ VRB
+    ),
+    fix_type = factor(
+      if_else(FixROI %in% c("LT", "RT"), AttT, AttB),
+      levels = c("P", "N", "B")
+    )
+  )
+```
+
+```{r fix-counts}
+# Per-box fixation counts from the long file.
+fix_counts <- long %>%
+  count(Subject, Trial, FixROI, name = "n_fix")
+
+# Total fixations per trial (used as an exposure offset = attention share).
+fix_total <- long %>%
+  count(Subject, Trial, name = "n_trial")
+
+# Full 4-box grid per trial, with value and type, joined to counts.
+box_grid <- boxlong %>%
+  transmute(Subject, Trial, WN, BPN, FixROI = box, type, value) %>%
+  left_join(fix_counts, by = c("Subject", "Trial", "FixROI")) %>%
+  left_join(fix_total,  by = c("Subject", "Trial")) %>%
+  mutate(
+    n_fix = replace_na(n_fix, 0L),
+    v     = value / 10          # scaled value for the linear term
+  ) %>%
+  filter(!is.na(n_trial), n_trial > 0)
+```
+
+---
+
+# Basic Psychometrics
+
+## Choice
+
+```{r psy-choice, fig.height=4}
+pdata_choice = pas %>%
+  group_by(Subject, BPN, WN, Diff) %>%
+  summarize(
+    y_subject = mean(ChooseL),
+    .groups = "drop"
+  ) %>%
+  group_by(BPN, WN, Diff) %>%
+  summarize(
+    se = sd(y_subject) / sqrt(n()),
+    y = mean(y_subject),
+    .groups = "drop"
+  )
+
+ggplot(pdata_choice, aes(x = Diff, y = y, color = WN)) +
+  facet_grid(. ~ BPN) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50") +
+  
+  #geom_line(position = position_dodge(width = 1), linewidth = 1) +
+  geom_pointrange(
+    aes(ymin = y - se, ymax = y + se),
+    size = .1,
+    position = position_dodge(width = 1),
+    linewidth = 1
+  ) +
+  stat_smooth(
+    method = "glm",
+    method.args = list(family = "binomial"),
+    se = FALSE,
+    geom = "line",
+    alpha = 0.7,
+    linewidth = 1
+  ) +
+  
+  labs(
+    x = "Value Difference (L - R)", 
+    y = "Pr(Choose Left)",
+    color = "Range",
+    title = "psychometric curves, by trial type and range"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+## RT
+
+```{r psy-rt, fig.height=4}
+pdata_rt <- pas %>%
+  group_by(Subject, BPN, WN, Difficulty) %>%
+  summarize(
+    y_subject = mean(RT),
+    .groups = "drop"
+  ) %>%
+  group_by(BPN, WN, Difficulty) %>%
+  summarize(
+    se = sd(y_subject) / sqrt(n()),
+    y = mean(y_subject),
+    .groups = "drop"
+  )
+
+ggplot(pdata_rt, aes(x = Difficulty, y = y, color = WN)) +
+  facet_grid(. ~ BPN) +
+  
+  #geom_line(position = position_dodge(width = 1), linewidth = 1) +
+  geom_pointrange(
+    aes(ymin = y - se, ymax = y + se),
+    size = .1,
+    position = position_dodge(width = 1),
+    linewidth = 1
+  ) +
+  stat_smooth(
+    method = "lm",
+    se = FALSE,
+    geom = "line",
+    alpha = 0.7,
+    linewidth = 1
+  ) +
+  
+  labs(
+    x = "Inverse Difficulty |L - R|",
+    y = "RT (s)",
+    color = "Range",
+    title = "response time by difficulty"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+---
+
+# Fixation Propoerties
+
+## Fixation duration by box and condition
+
+```{r fix-prop, fig.height=4}
+prop_dat <- pas %>%
+  group_by(Subject, BPN, WN) %>%
+  summarise(across(c(DwellLT, DwellLB, DwellRT, DwellRB), \(x) mean(x, na.rm = TRUE)), .groups = "drop") %>%
+  pivot_longer(c(DwellLT, DwellLB, DwellRT, DwellRB),
+               names_to = "box", values_to = "mean_dwell") %>%
+  mutate(box = str_remove(box, "Dwell")) %>%
+  group_by(BPN, WN, box) %>%
+  summarise(se = sd(mean_dwell, na.rm = TRUE) / sqrt(n()),
+            mean_dwell = mean(mean_dwell, na.rm = TRUE),
+            .groups = "drop")
+
+pd <- position_dodge(0.9)
+
+ggplot(prop_dat, aes(x = box, y = mean_dwell, fill = WN)) +
+  facet_grid(. ~ BPN) +
+  
+  geom_col(position = pd) +
+  geom_linerange(aes(ymin = mean_dwell - se, ymax = mean_dwell + se), position = pd, width = 0.25) +
+  
+  scale_fill_manual(values = plt$wn_colors) +
+  labs(
+    x = "Box",
+    y = "Mean Dwell (s)",
+    fill = "Range",
+    title = "mean dwell per box by condition"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+## Fixation duration by value
+
+Tests whether single-fixation duration tracks value. Expectation from prior work:
+roughly flat. Durations are strictly positive and right-skewed, so we model them
+on the log scale (a lognormal LMM); coefficients are interpreted on the log scale.
+Fit on ~323k fixation events with a subject random intercept; this chunk is the
+slowest of the non-Bayesian models.
+
+```{r dur-model}
+dur_dat <- long %>%
+  filter(FixDur > 0) %>%
+  mutate(v = fix_value / 10)
+
+dur_fit <- lmer(
+  log(FixDur) ~ fix_type * v + (1 | Subject),
+  data = dur_dat
+)
+summary(dur_fit)
+```
+
+```{r dur-plot, fig.height=4.5}
+pdata_dur <- dur_dat %>%
+  group_by(Subject, fix_type, fix_value) %>%
+  summarise(y_subject = mean(FixDur), .groups = "drop") %>%
+  group_by(fix_type, fix_value) %>%
+  summarise(
+    se       = sd(y_subject) / sqrt(n()),
+    mean_dur = mean(y_subject),
+    .groups = "drop"
+  )
+
+ggplot(pdata_dur, aes(x = fix_value, y = mean_dur, color = fix_type)) +
+  geom_pointrange(
+    aes(ymin = mean_dur - se, ymax = mean_dur + se),
+    size = .1,
+    linewidth = 1
+  ) +
+  stat_smooth(
+    method = "lm",
+    se = FALSE,
+    geom = "line",
+    alpha = 0.7,
+    linewidth = 1
+  ) +
+  scale_color_manual(values = plt$type_colors) +
+  labs(x = "Attribute Value", y = "Mean Fixation Duration (ms)", color = "Attribute Type",
+       title = "fixation duration by attribute type and value") +
+  theme(legend.position = "bottom")
+```
+
+## Refixations by type and value
+
+```{r count-model}
+count_fit <- glmmTMB(
+  n_fix ~ type * v + offset(log(n_trial)) + (1 | Subject),
+  data = box_grid, family = nbinom2
+)
+summary(count_fit)
+```
+
+```{r count-plot, fig.height=4}
+pdata_box_grid = box_grid %>%
+  group_by(Subject, type, value) %>%
+  summarise(share = mean(n_fix / n_trial), .groups = "drop") %>%
+  group_by(type, value) %>%
+  summarise(
+    se         = sd(share) / sqrt(n()),
+    mean_share = mean(share),
+    .groups = "drop"
+  )
+  
+ggplot(pdata_box_grid, aes(x = value, y = mean_share, color = type)) +
+  geom_hline(yintercept = 0.25, color = "grey") +
+  geom_pointrange(
+    aes(ymin = mean_share - se, ymax = mean_share + se),
+    size = .1,
+    linewidth = 1
+  ) +
+  stat_smooth(
+    method = "lm",
+    se = FALSE,
+    geom = "line",
+    alpha = 0.7,
+    linewidth = 1
+  ) +
+  scale_color_manual(values = plt$type_colors) +
+  labs(
+    x = "Attribute Value", 
+    y = "Mean Share of Fixations",
+    color = "Attribute Type",
+    title = "attention share by attribute type and value"
+  ) + 
+  theme(legend.position = "bottom")
+```
+
+---
+
+# Option-Level Attention
+
+## Net Fixation Bias
+
+```{r option-level}
+opt_fit <- glmmTMB(
+  ChooseL ~ Diff_z * DwellDiff_norm + (1 + Diff_z | Subject),
+  data = pas, family = binomial
+)
+summary(opt_fit)
+```
+
+---
+
+# Attribute-Level Attention
+
+We estimate a **signed attention weight**: the effect of
+one second of dwell on a box, on the log-odds of choosing that box's option,
+holding value difference constant.
+
+A positive weight means attention is associated with choosing the attended option. 
+A negative weight is associated with choosing against the attended option.
+
+## Non-Parametric Test
+
+Each (type × value) cell's attention weight is estimated with **partial pooling**:
+every subject gets their own weight per cell, drawn from a population
+distribution, and we report (and plot) the population mean. In a logistic model,
+leaving these subject-level slopes out biases the population weight *toward zero*
+(the marginal effect is attenuated relative to the subject-specific effect), so
+partial pooling both de-attenuates the average weight and yields honest,
+subject-aware uncertainty. The cell-level random slopes are left **uncorrelated**
+(`||`) to keep the model identifiable and convergent; subject-level value
+sensitivity (`SV_*`) keeps its correlated random slopes.
+
+```{r flex-design}
+# Attention design: signed dwell per (type x value) cell.
+flex_design <- boxlong %>%
+  group_by(Subject, Trial, cell) %>%
+  summarise(sd = sum(signed_dwell), .groups = "drop") %>%
+  pivot_wider(names_from = cell, values_from = sd, values_fill = 0)
+
+# Value design: signed value summed per type (SV_P, SV_N, SV_B). These three
+# sum to Diff (the total value difference) but split it into attribute-type
+# channels.
+value_design <- boxlong %>%
+  group_by(Subject, Trial, type) %>%
+  summarise(SV = sum(signed_value), .groups = "drop") %>%
+  pivot_wider(names_from = type, values_from = SV,
+              names_prefix = "SV_", values_fill = 0)
+
+flex_dat <- pas %>%
+  select(Subject, Trial, ChooseL) %>%
+  left_join(value_design, by = c("Subject", "Trial")) %>%
+  left_join(flex_design,  by = c("Subject", "Trial"))
+
+value_cols <- c("SV_P", "SV_N", "SV_B")
+cell_cols <- setdiff(names(flex_dat),
+                     c("Subject", "Trial", "ChooseL", value_cols))
+
+# Population (fixed) cell weights are the plotted "average" attention weights.
+# Each cell also gets an uncorrelated subject-level random slope (partial
+# pooling) so the population weight is not attenuated toward zero by unmodeled
+# between-subject heterogeneity. Value sensitivity (SV_*) keeps correlated
+# random slopes.
+flex_formula <- as.formula(paste(
+  "ChooseL ~", paste(value_cols, collapse = " + "), "+",
+  paste(cell_cols, collapse = " + "),
+  "+ (0 + SV_P + SV_N + SV_B | Subject)",
+  "+ (0 +", paste(cell_cols, collapse = " + "), "| Subject)"
+))
+flex_formula
+```
+
+```{r flex-fit}
+# Weakly informative priors. Predictors are scaled (Diff) or in seconds (dwell);
+# normal(0, 2.5) on slopes is mildly regularizing on the log-odds scale.
+flex_priors <- c(
+  prior(normal(0, 2.5), class = "b"),
+  prior(normal(0, 2),   class = "Intercept")
+)
+
+# Heavier sampler settings for this hierarchical model: more iterations for
+# stable tail-ESS on the random-effect SDs, and a higher adapt_delta /
+# max_treedepth to suppress divergences from the funnel geometry.
+flex_fit <- brm(
+  flex_formula,
+  data    = flex_dat,
+  family  = bernoulli(),
+  prior   = flex_priors,
+  chains  = BRMS_CHAINS, iter = 4000, seed = BRMS_SEED,
+  control = list(adapt_delta = 0.99, max_treedepth = 12),
+  file    = "brm_fits/flex_attention_weights_typeval_partpool"
+)
+flex_fit
+```
+
+```{r flex-plot, fig.height=5}
+# Tidy the cell weights into type/value for plotting.
+flex_draws <- as_draws_df(flex_fit)
+
+weight_summary <- map_dfr(cell_cols, function(cl) {
+  x <- flex_draws[[paste0("b_", cl)]]
+  h <- bayestestR::hdi(x, ci = 0.95)
+  tibble(cell = cl, estimate = median(x), lo = h$CI_low, hi = h$CI_high)
+}) %>%
+  mutate(
+    type  = str_extract(cell, "^[PNB]"),
+    sign  = if_else(str_detect(cell, "_neg"), -1, 1),
+    value = sign * as.numeric(str_extract(cell, "[0-9]+$")),
+    type  = factor(type, levels = c("N", "B", "P"))
+  )
+
+ggplot(weight_summary, aes(x = value, y = estimate, color = type)) +
+  geom_hline(yintercept = 0, linetype = 2, color = "grey50") +
+  
+  geom_pointrange(aes(ymin = lo, ymax = hi), size = .25, linewidth = 1) +
+  #geom_line() +
+  geom_smooth(method = "lm", se = FALSE, alpha = 0.7, linewidth = 1) +
+  
+  facet_wrap(~ type, scales = "free_x") +
+  scale_color_manual(values = plt$type_colors) +
+  labs(
+    x = "Attribute Value", 
+    y = "Attention Weight",
+    title = "signed attention weights by attribute type and value"
+  ) +
+  guides(color = "none")
+```
+
+---
+
+# Range Sensitivity
+
+This is a value-representation test, not an attention test. The question is whether
+a given value difference moves choice more in the Narrow range than the Wide range.
+We regress choice on the per-type signed value channels (`SV_P/SV_N/SV_B`) and
+interact each with the range condition. Range normalization predicts the slope of
+choice on value is steeper in Narrow, so each `SV_type:WNWide` interaction should be
+negative (value drives choice less when the range is wide).
+
+```{r value-design}
+# Signed value summed per type (SV_P, SV_N, SV_B): how much each attribute type's
+# value difference favors the left option. Built from value only -- no dwell time.
+# (value_design was already constructed above; rebuilt here so this section is
+# self-contained.)
+value_design <- boxlong %>%
+  group_by(Subject, Trial, type) %>%
+  summarise(SV = sum(signed_value), .groups = "drop") %>%
+  pivot_wider(names_from = type, values_from = SV,
+              names_prefix = "SV_", values_fill = 0)
+
+val_dat <- pas %>%
+  select(Subject, Trial, ChooseL, WN) %>%
+  left_join(value_design, by = c("Subject", "Trial"))
+```
+
+```{r value-fit}
+# Population value sensitivity per type, interacted with range; subjects get
+# heterogeneous value sensitivity via random slopes.
+val_fit <- brm(
+  ChooseL ~ (SV_P + SV_N + SV_B) * WN + (1 + SV_P + SV_N + SV_B | Subject),
+  data    = val_dat, family = bernoulli(),
+  prior   = c(prior(normal(0, 2.5), class = "b"),
+              prior(normal(0, 2),   class = "Intercept")),
+  chains  = BRMS_CHAINS, iter = BRMS_ITER, seed = BRMS_SEED,
+  control = list(adapt_delta = 0.95),
+  file    = "brm_fits/value_sensitivity_by_range"
+)
+val_fit
+```
+
+```{r value-readout}
+vd <- as_draws_df(val_fit)
+
+summ <- function(x) {
+  h <- bayestestR::hdi(x, ci = 0.95)
+  tibble(estimate = median(x), hdi_low = h$CI_low, hdi_high = h$CI_high,
+         p_neg = mean(x < 0))
+}
+
+# Per-type: Narrow slope, Wide slope, and the Wide-minus-Narrow range effect.
+# WN reference is Narrow, so b_SV_type is the Narrow slope and
+# b_SV_type:WNWide is (Wide slope - Narrow slope).
+slope_tbl <- map_dfr(c("N", "B", "P"), function(tt) {
+  narrow <- vd[[paste0("b_SV_", tt)]]
+  inter  <- vd[[paste0("b_SV_", tt, ":WNWide")]]
+  wide   <- narrow + inter
+  bind_rows(
+    summ(narrow) %>% mutate(quantity = "1_slope_Narrow"),
+    summ(wide)   %>% mutate(quantity = "2_slope_Wide"),
+    summ(inter)  %>% mutate(quantity = "3_Wide_minus_Narrow")
+  ) %>% mutate(type = tt)
+}) %>%
+  transmute(type = factor(type, levels = c("N", "B", "P")), quantity,
+            estimate = round(estimate, 3),
+            HDI = sprintf("[%.3f, %.3f]", hdi_low, hdi_high),
+            Pr_lt_0 = round(p_neg, 2)) %>%
+  arrange(type, quantity)
+
+slope_tbl
+```
+
+```{r value-readout-plot, fig.height=4.5}
+# Narrow vs Wide value-sensitivity slope per type, with 95% HDI.
+plot_dat <- slope_tbl %>%
+  filter(quantity %in% c("1_slope_Narrow", "2_slope_Wide")) %>%
+  mutate(WN = if_else(quantity == "1_slope_Narrow", "Narrow", "Wide"),
+         lo = as.numeric(str_extract(HDI, "(?<=\\[)[-0-9.]+")),
+         hi = as.numeric(str_extract(HDI, "(?<=, )[-0-9.]+")))
+
+ggplot(plot_dat, aes(x = type, y = estimate, color = WN)) +
+  geom_pointrange(aes(ymin = lo, ymax = hi),
+                  position = position_dodge(width = 0.4), linewidth = 1) +
+  scale_color_manual(values = plt$wn_colors) +
+  labs(x = "Attribute Type", y = "Value-sensitivity slope (log-odds per value/10)",
+       title = "value sensitivity by range condition", color = NULL) +
+  theme(legend.position = "bottom")
+```

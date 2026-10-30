@@ -1,0 +1,1741 @@
+---
+title: "Main Analysis: Attention to Aversive Attributes (Studies 1 and 2)"
+author: "Brenden Eum"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+    theme: flatly
+---
+
+Correlational analysis of the relationship between attention and choice in a
+2-attribute binary choice task where attributes can be positive (P), negative
+(N), or ambivalent (B). Study 1 (PAS3) and Study 2 (PAS4) use the same task;
+Study 2 doubled the trials per participant and blocked trial types.
+
+This notebook reads the merged data written by
+`code/preprocessing/merge_PAS3_PAS4_to_main_data.R` and produces every figure
+and regression table in the paper. Sections follow the order of the Results:
+
+1. Basic psychometrics
+2. Fixation properties
+3. Option-level attention
+4. Attribute-level attention
+5. Range sensitivity
+
+Figures are saved to `paper/figures/`, LaTeX tables to `paper/tables/`, and the
+statistics quoted in the text of the paper to `paper/text_output/` (one small
+.tex file each; see the "Text Output" subsections). The last section, "Extra
+Analyses", holds analyses that are not in the paper and is switched off by
+default.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  cache = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  dpi = 120
+)
+```
+
+# Preamble
+
+```{r libraries}
+library(tidyverse)
+library(glmmTMB)       # frequentist logistic mixed models
+library(lme4)          # frequentist linear mixed models
+library(brms)          # Bayesian attention-weight and value-sensitivity models
+library(bayestestR)    # highest density intervals
+library(patchwork)     # combining ggplots into one figure
+library(modelsummary)  # regression tables -> LaTeX
+
+# Project utilities. This gives us the plot theme (.myPlot), the Narrow / Wide
+# color and shape scales (.wn_colors, .wn_shapes), figure size defaults
+# (.figw, .figh, .linewidth), and `paths`.
+source(here::here("code/utilities/getAllUtilities.R"))
+```
+
+```{r options}
+# Set to FALSE for a fast, figures-only pass. The attribute-level figure still
+# gets drawn from the cached brms fits in notebooks/brm_fits/. Set to TRUE to
+# fit every regression, write the LaTeX tables and the in-text statistics, and
+# sample any brms model whose cache is missing (the two pooled attention-weight
+# fits take many hours each the first time; see
+# code/fitting/sample_pooled_attention_weights.R to run them from a terminal).
+RUN_REGRESSIONS <- FALSE
+
+# Where things live (absolute paths built from config/paths.yaml).
+data_dir <- file.path(paths$root, paths$data$processed)
+fig_dir  <- file.path(paths$root, paths$paper_figures)
+tab_dir  <- file.path(paths$root, paths$paper_tables)
+text_dir <- file.path(paths$root, paths$paper_text)
+fit_dir  <- file.path(paths$root, paths$notebooks, "brm_fits")
+for (d in c(fig_dir, tab_dir, text_dir, fit_dir)) dir.create(d, showWarnings = FALSE, recursive = TRUE)
+
+# brms sampling settings (cmdstanr backend).
+options(mc.cores = parallel::detectCores())
+options(brms.backend = "cmdstanr")
+BRMS_CHAINS <- 4
+BRMS_SEED   <- 1234
+
+# Keep numbers in the LaTeX tables plain (no siunitx \num{} wrappers).
+options("modelsummary_format_numeric_latex" = "plain")
+
+# Weakly informative priors used by every brms model below.
+brms_priors <- c(
+  prior(normal(0, 2.5), class = "b"),
+  prior(normal(0, 2),   class = "Intercept")
+)
+```
+
+```{r plot-helpers}
+# Layout conventions for every figure:
+#   - Narrow vs Wide is shown with color AND marker shape (wn_scales below).
+#   - Attribute type (N / B / P) is shown by faceting, so it needs no color.
+#   - Study is a title over each half of a combined figure, or a facet strip in
+#     figures that have no other faceting.
+#   - Size: every figure is 2 * .figw wide and (number of rows) * .figh tall,
+#     and all text sizes come from .tick_pt / .title_pt / .strip_pt in
+#     MyPlotOptions.
+study_labels <- as_labeller(c("1" = "Study 1", "2" = "Study 2"))
+type_labels  <- as_labeller(c("N" = "Aversive (N)", "B" = "Ambivalent (B)", "P" = "Appetitive (P)"))
+
+# Strips that say Study 1 / Study 2 (same look as the Study titles).
+strip_style <- theme(
+  strip.background = element_blank(),
+  strip.text       = element_text(size = .title_pt * .fontscale, face = "bold")
+)
+# Strips that say Aversive / Ambivalent / Appetitive. Small and not bold so
+# that all three fit on one line over a facet.
+type_strip_style <- theme(
+  strip.background = element_blank(),
+  strip.text       = element_text(size = .strip_pt * .fontscale)
+)
+no_strip <- theme(strip.text = element_blank())
+
+# Title over each study's half of a combined figure.
+study_title <- theme(plot.title = element_text(hjust = 0.5, face = "bold", size = .title_pt * .fontscale))
+
+# Narrow / Wide colors and markers. Both scales are named "Range", so ggplot
+# merges them into a single legend.
+wn_scales <- list(
+  scale_color_manual(name = "Range", values = .wn_colors),
+  scale_shape_manual(name = "Range", values = .wn_shapes)
+)
+
+# Nudge Narrow and Wide points apart slightly so they don't sit on top of each
+# other (the two ranges share most of their x-values).
+wn_dodge <- position_dodge(width = 2)
+
+# x-axis ticks for the N / B / P facets, where x is an attribute value. At this
+# text size, labeling every value ("-50 -40 -30 -20 -10") makes the labels run
+# into each other, so we label every other value of the Wide range instead.
+# With free x scales, ggplot calls this once per facet with that facet's limits.
+x_attr_breaks <- function(limits) {
+  if (limits[2] < 0) return(c(-50, -30, -10))   # aversive facet
+  if (limits[1] > 0) return(c(10, 30, 50))      # appetitive facet
+  c(-20, 0, 20)                                 # ambivalent facet
+}
+
+# Legends. .myPlot hides legends by default, so every plot with a Range legend
+# turns it on with legend_bottom. In a combined figure, guide_area() at the
+# bottom collects the identical legends into one centered legend. (The
+# installed patchwork, 1.3.0, can't apply themes to a patchwork object under
+# ggplot2 4.x, so we don't use `&` to set legend positions.)
+legend_bottom <- theme(legend.position = "bottom")
+legend_right <- theme(legend.position = "right")
+
+# Point and error-bar sizes for the means +/- SE in every figure. Fitted lines
+# use .linewidth from MyPlotOptions.
+pt_size      <- 0
+pt_linewidth <- 0.7
+```
+
+```{r model-helpers}
+# Load a cached brms fit if it exists. If it doesn't, fit it only when
+# RUN_REGRESSIONS is TRUE; otherwise return NULL so the plotting code can skip
+# that panel. brm() itself does the caching through its `file` argument.
+load_or_fit <- function(name, ...) {
+  file <- file.path(fit_dir, name)
+  if (!file.exists(paste0(file, ".rds")) && !RUN_REGRESSIONS) {
+    cat("No cached fit for", name, "and RUN_REGRESSIONS is FALSE. Skipping.\n")
+    return(NULL)
+  }
+  brm(..., file = file)
+}
+
+# Regression tables. Every regression crosses its predictors with range
+# (WNWide) and study (Study2), so each predictor has four coefficients: its
+# value at the reference levels (Narrow, Study 1) and its interactions with
+# Wide, with Study 2, and with both. Listed as rows, those ran the tables off
+# the page, so each predictor gets one row and its four coefficients go in
+# four columns. The column headers, keyed by moderator:
+range_study_columns <- c("ref"           = "Narrow, Study 1",
+                         "WNWide"        = "× Wide",
+                         "Study2"        = "× Study 2",
+                         "WNWide:Study2" = "× Wide × Study 2")
+# The attention-weight models are fit within one range, so they only have study.
+study_columns <- c("ref" = "Study 1", "Study2" = "× Study 2")
+
+# Split coefficient names such as "Diff10:WNWide:Study2" into the predictor
+# ("Diff10") and its moderators ("WNWide:Study2"). A coefficient with no
+# moderator gets "ref"; a moderator on its own (e.g. "WNWide") is the
+# intercept's interaction.
+split_moderators <- function(term) {
+  out <- tibble()
+  for (tm in term) {
+    pieces <- str_split(tm, ":")[[1]]
+    is_mod <- pieces %in% c("WNWide", "Study2")
+    out <- bind_rows(out, tibble(
+      predictor = if (all(is_mod)) "(Intercept)" else paste(pieces[!is_mod], collapse = ":"),
+      moderator = if (any(is_mod)) paste(pieces[is_mod], collapse = ":") else "ref"
+    ))
+  }
+  out
+}
+
+# Readable names for the predictors. Values are in units of 10 points and
+# dwell times in seconds.
+term_labels <- c(
+  "(Intercept)"    = "Intercept",
+  "Intercept"      = "Intercept",        # brms spells it without parentheses
+  "Diff10"         = "Value Diff.",      # left minus right
+  "Difficulty10"   = "Abs. Value Diff.", # best minus worst
+  "DwellDiff"      = "Net Dwell",        # left minus right
+  "RelDiff10_last" = "Value Diff.",      # last-fixated minus other option
+  "LastTypeN"      = "Last N",
+  "LastTypeB"      = "Last B",
+  "fix_typeN"      = "Type N",
+  "fix_typeB"      = "Type B",
+  "fix_value10"    = "Value",
+  "typeN"          = "Type N",
+  "typeB"          = "Type B",
+  "value10"        = "Value",
+  "SV_P"           = "Value (P)",
+  "SV_N"           = "Value (N)",
+  "SV_B"           = "Value (B)"
+)
+
+# Label predictors with term_labels, piece by piece for interactions
+# ("Diff10:DwellDiff" -> "Value Diff. × Net Dwell"). Attention-weight cells
+# read like the figures ("N_neg50" -> "N, -50"). Anything else passes through.
+label_term <- function(term) {
+  labels <- c()
+  for (tm in term) {
+    pieces <- str_split(tm, ":")[[1]]
+    for (k in seq_along(pieces)) {
+      if (pieces[k] %in% names(term_labels)) {
+        pieces[k] <- term_labels[[pieces[k]]]
+      } else if (str_detect(pieces[k], "^[PNB]_(neg|pos)[0-9]+$")) {
+        sign <- if (str_detect(pieces[k], "_neg")) "-" else ""
+        pieces[k] <- paste0(str_sub(pieces[k], 1, 1), ", ", sign, str_extract(pieces[k], "[0-9]+$"))
+      }
+    }
+    labels <- c(labels, paste(pieces, collapse = " × "))
+  }
+  labels
+}
+
+# Fixed effects of an lme4 or glmmTMB fit with 95% Wald CIs.
+tidy_freq <- function(fit) {
+  get_estimates(fit) %>%
+    filter(effect == "fixed") %>%
+    select(term, estimate, conf.low, conf.high)
+}
+
+# Random-effect SDs of an lme4 or glmmTMB fit, named by predictor. modelsummary
+# calls them "SD (Diff10 Subject)", and the residual SD of a linear model
+# "SD (Observations)".
+sds_freq <- function(fit) {
+  re  <- get_estimates(fit) %>% filter(str_detect(term, "^SD \\("))
+  nms <- re$term %>%
+    str_remove("^SD \\(") %>%
+    str_remove(" Subject\\)$") %>%
+    str_replace("^Observations\\)$", "Residual")
+  setNames(re$estimate, nms)
+}
+
+# Fit statistics for the bottom of a table: number of trials, marginal and
+# conditional R2 (Nakagawa's, as computed by modelsummary through the
+# performance package), and how the model was estimated ("Frequentist (lme4)").
+gof_freq <- function(fit, estimation) {
+  g <- get_gof(fit)
+  tibble(
+    nobs           = g$nobs,
+    r2.marginal    = if (is.null(g$r2.marginal))    NA_real_ else g$r2.marginal,
+    r2.conditional = if (is.null(g$r2.conditional)) NA_real_ else g$r2.conditional,
+    estimation     = estimation
+  )
+}
+
+# One model as the columns of a regression table: a modelsummary_list per
+# moderator in `columns`, holding that moderator's coefficient for every
+# predictor (the rows). The fit statistics go under the first column only.
+# Numbers are formatted here, to `digits` decimals, so that one panel of a
+# table can show more decimals than another.
+table_columns <- function(coefs, gof, columns, digits = 3) {
+  coefs <- bind_cols(coefs, split_moderators(coefs$term))
+  fmt   <- function(x) formatC(x, format = "f", digits = digits)
+
+  out <- list()
+  for (m in names(columns)) {
+    rows <- coefs %>% filter(moderator == m)
+    tidy <- tibble(
+      term      = label_term(rows$predictor),
+      estimate  = fmt(rows$estimate),
+      conf.low  = fmt(rows$conf.low),
+      conf.high = fmt(rows$conf.high)
+    )
+    glance <- if (m == names(columns)[1]) gof else tibble(nobs = NA_real_)
+    out[[columns[[m]]]] <- structure(list(tidy = tidy, glance = glance), class = "modelsummary_list")
+  }
+  out
+}
+
+# The same for an lme4 / glmmTMB fit crossed with range and study, which is
+# every frequentist model in the paper.
+freq_columns <- function(fit, estimation, digits = 3) {
+  table_columns(tidy_freq(fit), gof_freq(fit, estimation), range_study_columns, digits)
+}
+
+# Table note with the random-effect SDs. `sds` is a list with one named vector
+# per panel (from sds_freq or sds_brms), named by panel ("Panel A") or unnamed
+# for a table with one model. Entries are separated by semicolons because cell
+# labels ("N, -30") have commas in them.
+sd_note <- function(sds, intro = "Random-effect SDs across subjects.") {
+  parts <- c()
+  for (p in seq_along(sds)) {
+    x       <- sds[[p]]
+    entries <- paste(label_term(names(x)), formatC(x, format = "f", digits = 3), collapse = "; ")
+    panel   <- names(sds)[p]
+    if (is.null(panel) || panel == "") {
+      parts <- c(parts, paste0(entries, "."))
+    } else {
+      parts <- c(parts, paste0(panel, ": ", entries, "."))
+    }
+  }
+  paste("\\textit{Note.}", intro, paste(parts, collapse = " "))
+}
+
+# Write a regression table to paper/tables/<name>.tex as a booktabs tabular
+# plus an optional note under it (so it can be \input into a table environment
+# in the paper), and echo the LaTeX so it also shows up in the knitted
+# notebook. `tab` is either one model's columns (from table_columns) or a named
+# list of them, one per panel ("Panel A: Choice" = ...), which modelsummary
+# stacks with shape = "rbind". Intervals go on a line of their own under each
+# estimate, unless `ci_inline` is TRUE, which puts them next to the estimate
+# (halving the length of a table that has room to spare in width).
+save_tex <- function(tab, name, note = NULL, ci_inline = FALSE) {
+  file      <- file.path(tab_dir, paste0(name, ".tex"))
+  is_panels <- !inherits(tab[[1]], "modelsummary_list")
+  if (ci_inline) {
+    estimate  <- "{estimate} [{conf.low}, {conf.high}]"
+    statistic <- NULL
+  } else {
+    estimate  <- "{estimate}"
+    statistic <- "conf.int"
+  }
+
+  # The only fit statistics we report (in this order). "estimation" is the
+  # label from gof_freq / gof_brms, so the reader can tell which models were
+  # fit by maximum likelihood and which by MCMC.
+  gof_map <- list(
+    list(raw = "nobs",           clean = "Num.Obs.",   fmt = 0),
+    list(raw = "r2.marginal",    clean = "R2 Marg.",   fmt = 3),
+    list(raw = "r2.conditional", clean = "R2 Cond.",   fmt = 3),
+    list(raw = "estimation",     clean = "Estimation", fmt = identity)
+  )
+  if (is_panels) {
+    tex <- modelsummary(tab, shape = "rbind", estimate = estimate, statistic = statistic,
+                        gof_map = gof_map, output = "latex_tabular")
+  } else {
+    tex <- modelsummary(tab, estimate = estimate, statistic = statistic,
+                        gof_map = gof_map, output = "latex_tabular")
+  }
+  tex   <- strsplit(paste(as.character(tex), collapse = "\n"), "\n")[[1]]
+  n_col <- nchar(str_match(tex[1], "\\{(l+)\\}")[, 2])
+
+  # modelsummary's bare tabular has no horizontal rules and writes a panel's
+  # title into every column. Go through it line by line and add the usual
+  # booktabs rules, one title per panel, and a single Estimation label per
+  # model spread over all the coefficient columns.
+  out <- c()
+  for (i in seq_along(tex)) {
+    line  <- tex[i]
+    cells <- str_trim(str_split(str_remove(str_trim(line), "\\\\\\\\$"), "&")[[1]])
+    if (str_detect(line, "^\\\\begin\\{tabular\\}")) {
+      out <- c(out, line, "\\toprule")
+    } else if (i == 2) {
+      # the header; a panel title below it brings its own rule
+      out <- c(out, line)
+      if (!is_panels) out <- c(out, "\\midrule")
+    } else if (str_detect(line, "^\\\\end\\{tabular\\}")) {
+      out <- c(out, "\\bottomrule", line)
+    } else if (length(cells) == n_col && cells[1] != "" && all(cells == cells[1])) {
+      out <- c(out, "\\midrule", paste0("\\multicolumn{", n_col, "}{l}{\\textit{", cells[1], "}} \\\\"))
+    } else if (str_detect(line, "^Num.Obs.")) {
+      out <- c(out, if (is_panels) "\\addlinespace" else "\\midrule", line)
+    } else if (str_detect(line, "^R2 ")) {
+      out <- c(out, paste0("$R^2$", str_remove(line, "^R2")))
+    } else if (str_detect(line, "^Estimation")) {
+      out <- c(out, paste0("Estimation & \\multicolumn{", n_col - 1, "}{l}{", cells[2], "} \\\\"))
+    } else {
+      out <- c(out, line)
+    }
+  }
+
+  # The note spans the text width, in a smaller font, under the table.
+  if (!is.null(note)) {
+    out <- c(out, "\\par\\medskip",
+             paste0("\\begin{minipage}{\\linewidth}\\footnotesize ", note, "\\end{minipage}"))
+  }
+
+  writeLines(out, file)
+  cat(out, sep = "\n")
+}
+
+# Population-level effects of a brms fit as a tidy table: posterior median and
+# 95% HDI for every b_ parameter (the "b_" prefix is dropped from the names).
+tidy_brms <- function(fit) {
+  draws <- as_draws_df(fit, variable = "^b_", regex = TRUE)
+  pars  <- grep("^b_", names(draws), value = TRUE)
+
+  out <- tibble()
+  for (par in pars) {
+    x <- draws[[par]]
+    h <- bayestestR::hdi(x, ci = 0.95)
+    out <- bind_rows(out, tibble(
+      term = str_remove(par, "^b_"), estimate = median(x),
+      conf.low = h$CI_low, conf.high = h$CI_high
+    ))
+  }
+  out
+}
+
+# Posterior medians of the subject-level SDs of a brms fit, named by predictor
+# like sds_freq ("sd_Subject__SV_P" -> "SV_P").
+sds_brms <- function(fit) {
+  draws <- as_draws_df(fit, variable = "^sd_", regex = TRUE)
+  pars  <- grep("^sd_", names(draws), value = TRUE)
+  sds   <- c()
+  for (par in pars) {
+    sds[str_remove(par, "^sd_Subject__")] <- median(draws[[par]])
+  }
+  sds[cell_order(names(sds))]   # same order as the table rows
+}
+
+# Fit statistics of a brms fit, like gof_freq. modelsummary would compute LOO
+# for these big fits, which takes forever, so we compute the Bayesian R2
+# ourselves: conditional on the subject effects, and marginal (without them).
+# 1,000 evenly spaced posterior draws are plenty for a median.
+gof_brms <- function(fit, estimation = "Bayesian (brms)") {
+  ids <- round(seq(1, ndraws(fit), length.out = 1000))
+  tibble(
+    nobs           = nrow(fit$data),
+    r2.marginal    = median(bayes_R2(fit, re_formula = NA, summary = FALSE, draw_ids = ids)),
+    r2.conditional = median(bayes_R2(fit, summary = FALSE, draw_ids = ids)),
+    estimation     = estimation
+  )
+}
+
+# Order for the attention-weight tables: the intercept and value channels as
+# they come, then the cells sorted like the figures, by type (N, B, P) and then
+# by value. `pred` are predictor names such as "SV_P" or "N_neg50".
+cell_order <- function(pred) {
+  is_cell <- str_detect(pred, "^[PNB]_(neg|pos)[0-9]+$")
+  type    <- match(str_sub(pred, 1, 1), c("N", "B", "P"))
+  value   <- as.numeric(str_extract(pred, "[0-9]+$")) * if_else(str_detect(pred, "_neg"), -1, 1)
+  # order() is stable, so the non-cells (all ties here) keep their order
+  order(is_cell, ifelse(is_cell, type, 0), ifelse(is_cell, value, 0))
+}
+
+# Rows of a tidy coefficient table in that order.
+order_cells <- function(coefs) {
+  coefs[cell_order(split_moderators(coefs$term)$predictor), ]
+}
+```
+
+```{r text-helpers}
+# Statistics quoted in the text of the paper. Each one is a short LaTeX math
+# snippet saved to paper/text_output/<name>.tex, which main.tex pulls in with
+# \input{text_output/<name>} in place of the numbers. write.text() (from
+# code/utilities) writes the string with no trailing newline, so \input adds
+# no stray space inside a parenthesis.
+# Notation: the study (or a contrast between studies) is always the subscript;
+# the superscript is for everything else (attribute type, range, predictor...).
+save_text <- function(text, name) {
+  write.text(text, file.path(text_dir, paste0(name, ".tex")))
+  cat(text, "\n")
+}
+
+# "0.013\ [0.003, 0.023]": an estimate with its 95% interval.
+fmt_ci <- function(est, lo, hi, digits = 3) {
+  sprintf("%.*f\\ [%.*f, %.*f]", digits, est, digits, lo, digits, hi)
+}
+
+# p-values: three decimals, or scientific notation below .001 (e.g. "p = 3e-15").
+fmt_p <- function(p) {
+  if (p < 0.001) paste0("p = ", formatC(p, format = "e", digits = 0)) else sprintf("p = %.3f", p)
+}
+
+# Estimate and 95% Wald CI of a linear combination of fixed effects, e.g. the
+# Study 2 slope = b_slope + b_slope:Study2. `terms` are coefficient names and
+# `weights` their multipliers (by default they are just added up). lmer
+# returns fixef() and vcov() directly; glmmTMB wraps them in a list with a
+# $cond element. With tens of thousands of trials the 1.96 normal cutoff gives
+# the same intervals as the tables (to three decimals).
+coef_ci <- function(fit, terms, weights = rep(1, length(terms))) {
+  b <- fixef(fit); if (is.list(b)) b <- b$cond
+  V <- vcov(fit);  if (is.list(V)) V <- V$cond
+  V <- as.matrix(V)
+  est <- sum(weights * b[terms])
+  se  <- sqrt(as.numeric(t(weights) %*% V[terms, terms] %*% weights))
+  c(estimate = est, lo = est - 1.96 * se, hi = est + 1.96 * se)
+}
+
+# The same, already formatted, so one snippet is one line of code.
+fmt_coef <- function(fit, terms, weights = rep(1, length(terms)), digits = 3) {
+  ci <- coef_ci(fit, terms, weights)
+  fmt_ci(ci[["estimate"]], ci[["lo"]], ci[["hi"]], digits)
+}
+
+# Posterior median and 95% HDI of a vector of draws, formatted like fmt_ci.
+fmt_post <- function(draws, digits = 3) {
+  h <- bayestestR::hdi(draws, ci = 0.95)
+  fmt_ci(median(draws), h$CI_low, h$CI_high, digits)
+}
+
+# t-test between two vectors of subject means, in the format
+# "$\Delta^{sup}_{sub} = 2.59$, $d = 0.39$, $t(1298.3) = 7.1$, $p = 2e-12$",
+# where `sup` says what is compared (e.g. "\\text{Wide - Narrow}") and `sub`
+# the study (e.g. "Study 1"; left out if NULL). Welch's test by default;
+# paired = TRUE when both vectors come from the same subjects in the same
+# order. Cohen's d uses the pooled SD (Welch) or the SD of the paired
+# differences. `unit` is appended to Delta (e.g. "\\ \\text{s}").
+fmt_ttest <- function(x, y, sup, sub = NULL, unit = "", paired = FALSE, digits = 2) {
+  tt    <- t.test(x, y, paired = paired)
+  delta <- mean(x) - mean(y)
+  if (paired) {
+    d <- delta / sd(x - y)
+  } else {
+    sp <- sqrt(((length(x) - 1) * var(x) + (length(y) - 1) * var(y)) / (length(x) + length(y) - 2))
+    d  <- delta / sp
+  }
+  df   <- tt$parameter
+  df   <- if (df == round(df)) sprintf("%d", df) else sprintf("%.1f", df)   # paired tests: whole df
+  name <- paste0("\\Delta^{", sup, "}", if (!is.null(sub)) paste0("_{\\text{", sub, "}}"))
+  sprintf("$%s = %.*f%s$, $d = %.2f$, $t(%s) = %.1f$, $%s$",
+          name, digits, delta, unit, d, df, tt$statistic, fmt_p(tt$p.value))
+}
+```
+
+---
+
+# Data
+
+```{r read-data}
+pas_raw  <- read_csv(file.path(data_dir, "main_data.csv"),      show_col_types = FALSE)
+long_raw <- read_csv(file.path(data_dir, "main_data_long.csv"), show_col_types = FALSE)
+```
+
+## Trial level
+
+One row per trial. `Subject` is already unique across studies (e.g. "S1_5" vs
+"S2_5"), so it can be used directly as the grouping variable everywhere.
+
+```{r clean-trial}
+pas <- pas_raw %>%
+  mutate(
+    WN      = factor(WN,  levels = c("Narrow", "Wide")),   # Narrow is the reference level
+    BPN     = factor(BPN, levels = c("PN", "PB", "NB")),
+    ChooseL = as.integer(ChooseL),                         # TRUE/FALSE -> 1/0
+    Correct = as.integer(Correct),
+    Difficulty = abs(Diff),                                # best minus worst option value
+    # Regressions use value in units of 10 points, matching the paper's SV_* convention.
+    Diff10       = Diff / 10,
+    Difficulty10 = Difficulty / 10
+  )
+```
+
+## Box level
+
+Each trial has four boxes (left/right option x top/bottom attribute). Stack them
+so there is one row per box, with the box's attribute type, value, and dwell
+time. Left boxes get a side sign of +1 (looking there should push choice toward
+"left"), right boxes -1.
+
+```{r boxlong}
+mk_box <- function(df, box, side_sign, type_col, val_col, dwell_col) {
+  df %>%
+    transmute(
+      Study, Subject, Trial, WN, ChooseL,
+      box       = box,
+      side_sign = side_sign,
+      type      = .data[[type_col]],
+      value     = .data[[val_col]],
+      dwell     = .data[[dwell_col]]
+    )
+}
+
+boxlong <- bind_rows(
+  mk_box(pas, "LT",  1, "AttT", "VLT", "DwellLT"),
+  mk_box(pas, "LB",  1, "AttB", "VLB", "DwellLB"),
+  mk_box(pas, "RT", -1, "AttT", "VRT", "DwellRT"),
+  mk_box(pas, "RB", -1, "AttB", "VRB", "DwellRB")
+) %>%
+  mutate(
+    type = factor(type, levels = c("P", "N", "B")),
+    # Signed dwell: seconds, positive if it should push choice toward this box's side.
+    signed_dwell = side_sign * dwell,
+    # Signed value, in units of 10 points.
+    signed_value = side_sign * value / 10,
+    # Cell label for (type x value), e.g. "N_neg10", "P_pos5". Used to name the
+    # attention-weight coefficients.
+    cell = paste0(type, "_", if_else(value < 0, "neg", "pos"), abs(value))
+  )
+```
+
+## Fixation level
+
+One row per fixation (mouse hover). `FixDur` is in ms. Tag each fixation with
+the value and type of the box it landed on.
+
+```{r clean-long}
+long <- long_raw %>%
+  mutate(
+    WN = factor(WN, levels = c("Narrow", "Wide")),
+    fix_value = case_when(
+      FixROI == "LT" ~ VLT, FixROI == "RT" ~ VRT,
+      FixROI == "LB" ~ VLB, FixROI == "RB" ~ VRB
+    ),
+    fix_value10 = fix_value / 10,
+    fix_type = factor(if_else(FixROI %in% c("LT", "RT"), AttT, AttB),
+                      levels = c("P", "N", "B")),
+    fix_side = if_else(FixROI %in% c("LT", "LB"), "L", "R")
+  )
+```
+
+### First and last fixation of each trial
+
+Needed for the first-fixation and last-fixation analyses. Trials with no
+fixation record (about 500 per study) get NA here and drop out of those
+analyses.
+
+```{r first-last}
+first_last <- long %>%
+  arrange(Study, Subject, Trial, FixNum) %>%
+  group_by(Study, Subject, Trial) %>%
+  summarise(
+    FirstSide = first(fix_side),
+    LastSide  = last(fix_side),
+    LastType  = last(fix_type),
+    .groups   = "drop"
+  )
+
+pas <- pas %>%
+  left_join(first_last, by = c("Study", "Subject", "Trial")) %>%
+  mutate(
+    # Was the first fixation to the better option? Undefined when the options tie.
+    BestSide     = case_when(Diff > 0 ~ "L", Diff < 0 ~ "R", TRUE ~ NA_character_),
+    FirstFixBest = as.integer(FirstSide == BestSide),
+    # Did the subject choose the option they looked at last?
+    ChooseLast = as.integer((LastSide == "L") == (ChooseL == 1)),
+    # Value difference from the point of view of the last-fixated option
+    # (last-fixated option minus the other one).
+    RelDiff_last   = if_else(LastSide == "L", VL - VR, VR - VL),
+    RelDiff10_last = RelDiff_last / 10
+  )
+```
+
+### Fixation counts per box
+
+For the share-of-fixations analysis: how many of a trial's fixations went to
+each box. Boxes that were never fixated get a count of 0.
+
+```{r box-grid}
+fix_counts <- long %>% count(Study, Subject, Trial, FixROI, name = "n_fix")
+fix_total  <- long %>% count(Study, Subject, Trial, name = "n_trial")
+
+box_grid <- boxlong %>%
+  transmute(Study, Subject, Trial, WN, FixROI = box, type, value, value10 = value / 10) %>%
+  left_join(fix_counts, by = c("Study", "Subject", "Trial", "FixROI")) %>%
+  left_join(fix_total,  by = c("Study", "Subject", "Trial")) %>%
+  filter(!is.na(n_trial)) %>%                 # trials with no fixation record drop out
+  mutate(
+    n_fix = replace_na(n_fix, 0L),
+    share = n_fix / n_trial
+  )
+```
+
+---
+
+# Basic Psychometrics
+
+Choice as a function of the value difference between options, and response
+time as a function of difficulty (best minus worst option value). In every
+figure, points are means across participants with standard errors (each
+participant contributes one mean per x-value first, then we average over
+participants).
+
+```{r psych-choice}
+pdata_choice <- pas %>%
+  group_by(Study, Subject, WN, Diff) %>%
+  summarise(y_subject = mean(ChooseL), .groups = "drop") %>%
+  group_by(Study, WN, Diff) %>%
+  summarise(y = mean(y_subject), se = sd(y_subject) / sqrt(n()), .groups = "drop")
+
+p_choice <- ggplot(pdata_choice, aes(x = Diff, y = y, color = WN, shape = WN)) +
+  facet_wrap(~ Study, labeller = study_labels) +
+  geom_vline(xintercept = 0,   linetype = "dotted", color = "grey50") +
+  geom_hline(yintercept = 0.5, linetype = "dotted", color = "grey50") +
+  geom_line(linewidth = .linewidth, position = wn_dodge) +
+  geom_pointrange(aes(ymin = y - se, ymax = y + se), size = pt_size, linewidth = .linewidth,
+                  position = wn_dodge) +
+  #stat_smooth(method = "glm", method.args = list(family = "binomial"), se = FALSE, linewidth = .linewidth) +
+  wn_scales +
+  labs(x = "Value Difference (L - R)", y = "Pr(Choose Left)") +
+  .myPlot + strip_style + legend_right +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.5), labels = scales::percent_format(accuracy = 1))
+```
+
+```{r psych-rt}
+pdata_rt <- pas %>%
+  group_by(Study, Subject, WN, Difficulty) %>%
+  summarise(y_subject = mean(RT), .groups = "drop") %>%
+  group_by(Study, WN, Difficulty) %>%
+  summarise(y = mean(y_subject), se = sd(y_subject) / sqrt(n()), .groups = "drop")
+
+p_rt <- ggplot(pdata_rt, aes(x = Difficulty, y = y, color = WN, shape = WN)) +
+  facet_wrap(~ Study, labeller = study_labels) +
+  geom_line(linewidth = .linewidth, position = wn_dodge) +
+  geom_pointrange(aes(ymin = y - se, ymax = y + se), size = pt_size, linewidth = .linewidth, position = wn_dodge) +
+  #stat_smooth(method = "lm", se = FALSE, linewidth = .linewidth) +
+  wn_scales +
+  labs(x = "Best - Worst Value", y = "Response Time (s)") +
+  .myPlot + strip_style + no_strip + legend_right +
+  coord_cartesian(ylim = c(4, 10))
+```
+
+```{r fig-psychometrics, fig.width=2 * .figw, fig.height=2 * .figh}
+# 2 rows (choice, RT) x 2 columns (Study 1, Study 2).
+fig_psych <- (p_choice / p_rt) +
+  plot_layout(guides = "collect")
+
+ggsave(file.path(fig_dir, "basic_psychometrics.pdf"), fig_psych, width = 2 * .figw, height = 2 * .figh)
+fig_psych
+```
+
+## Regressions
+
+One model per outcome, pooled across both studies. Choice on value difference,
+and RT on difficulty, each interacted with range and with study. Study 1 and
+Narrow are the reference levels, so a `Study2` term is the Study 2 minus
+Study 1 difference (at Narrow) and a `WNWide` term is the Wide minus Narrow
+difference (in Study 1); the Study 2 version of any effect is the Study 1
+coefficient plus its `:Study2` interaction. Random intercepts and slopes by
+subject. In the RT model the intercept-slope correlation went to -1 when
+estimated (a singular fit), so those random effects are uncorrelated.
+
+```{r psych-regressions}
+if (RUN_REGRESSIONS) {
+  d <- pas %>% mutate(Study = factor(Study))   # 1 / 2 -> "1" / "2", reference "1"
+
+  fit_choice <- glmmTMB(
+    ChooseL ~ Diff10 * WN * Study + (1 + Diff10 | Subject),
+    data = d, family = binomial
+  )
+
+  fit_rt <- lmer(
+    RT ~ Difficulty10 * WN * Study + (1 + Difficulty10 || Subject),
+    data = d, control = lmerControl(optimizer = "bobyqa")
+  )
+
+  # One panel per model, with the random-effect SDs in the note.
+  tab <- list(
+    "Panel A: Choice" = freq_columns(fit_choice, "Frequentist (glmmTMB)"),
+    "Panel B: RT"     = freq_columns(fit_rt,     "Frequentist (lme4)")
+  )
+  note <- sd_note(list("Panel A" = sds_freq(fit_choice), "Panel B" = sds_freq(fit_rt)))
+  save_tex(tab, "basic_psychometrics", note)
+}
+```
+
+## Text Output
+
+The statistics quoted in the Basic Psychometrics paragraph of the paper, one
+chunk per snippet (see `save_text` in the preamble).
+
+```{r text-rt-study-level}
+if (RUN_REGRESSIONS) {
+  # Study 2 minus Study 1 response time (s) from the pooled RT model. Study 1
+  # and Narrow are the reference levels, so this is the difference at Narrow
+  # and a value difference of 0.
+  save_text(paste0("$\\Delta_{\\text{Study 2 - Study 1}} = ", fmt_coef(fit_rt, "Study2"), "\\ \\text{s}$"),
+            "rt_study_level")
+}
+```
+
+```{r text-rt-study-slope}
+if (RUN_REGRESSIONS) {
+  # Study 2 minus Study 1 difference in the RT slope on difficulty (s per 10
+  # points): the Difficulty x Study interaction.
+  save_text(paste0("$\\beta^{\\text{Difficulty}}_{\\text{Study 2 - Study 1}} = ", fmt_coef(fit_rt, "Difficulty10:Study2"), "$"),
+            "rt_study_slope")
+}
+```
+
+```{r text-rt-range-level}
+if (RUN_REGRESSIONS) {
+  # Wide minus Narrow response time (s) per study. WNWide is the Study 1
+  # difference; Study 2 adds the WNWide:Study2 interaction.
+  save_text(paste0(
+    "$\\Delta^{\\text{Wide - Narrow}}_{\\text{Study 1}} = ", fmt_coef(fit_rt, "WNWide"), "$; ",
+    "$\\Delta^{\\text{Wide - Narrow}}_{\\text{Study 2}} = ", fmt_coef(fit_rt, c("WNWide", "WNWide:Study2")), "$"
+  ), "rt_range_level")
+}
+```
+
+```{r text-rt-familiarity}
+if (RUN_REGRESSIONS) {
+  # Is Study 2 faster only because its subjects had more practice (60 trials
+  # vs 30)? Mean RT per subject over a window of trial numbers. Picking by
+  # trial number means trials dropped in preprocessing are missing the same
+  # way in both studies.
+  subj_rt <- function(s, trials) {
+    pas %>%
+      filter(Study == s, Trial %in% trials) %>%
+      group_by(Subject) %>%
+      summarise(rt = mean(RT), .groups = "drop") %>%
+      pull(rt)
+  }
+  rt_s1       <- subj_rt(1, 1:30)   # all of Study 1
+  rt_s2_early <- subj_rt(2, 1:30)
+  rt_s2_late  <- subj_rt(2, 31:60)
+
+  # Welch t-tests, Study 2 minus Study 1 (s): Study 2's later trials first,
+  # then the trials where both studies had the same amount of practice.
+  save_text(paste(
+    fmt_ttest(rt_s2_late,  rt_s1, sup = "\\text{Trials 31--60 vs. 1--30}",
+              sub = "Study 2 - Study 1", unit = "\\ \\text{s}"),
+    fmt_ttest(rt_s2_early, rt_s1, sup = "\\text{Trials 1--30 vs. 1--30}",
+              sub = "Study 2 - Study 1", unit = "\\ \\text{s}"),
+    sep = "; "), "rt_familiarity")
+}
+```
+
+---
+
+# Fixation Properties
+
+How attention was allocated before asking how it relates to choice: where the
+first fixation went, how long individual fixations lasted, and how often each
+box was revisited.
+
+```{r fix-first}
+# Pr(first fixation lands on the better option), by difficulty.
+pdata_first <- pas %>%
+  filter(!is.na(FirstFixBest)) %>%
+  group_by(Study, Subject, WN, Difficulty) %>%
+  summarise(y_subject = mean(FirstFixBest), .groups = "drop") %>%
+  group_by(Study, WN, Difficulty) %>%
+  summarise(y = mean(y_subject), se = sd(y_subject) / sqrt(n()), .groups = "drop")
+
+# One plot per study; the "Study s" title goes over each half of the combined
+# figure. coord_cartesian() comes after .myPlot so that it isn't overwritten.
+p_first <- list()
+for (s in 1:2) {
+  p_first[[s]] <- ggplot(pdata_first %>% filter(Study == s),
+                         aes(x = Difficulty, y = y, color = WN, shape = WN)) +
+    geom_hline(yintercept = 0.5, linetype = "dotted", color = "grey50") +
+    geom_line(linewidth = .linewidth, position = wn_dodge) +
+    geom_pointrange(aes(ymin = y - se, ymax = y + se), size = pt_size, linewidth = .linewidth, position = wn_dodge) +
+    #stat_smooth(method = "glm", method.args = list(family = "binomial"), se = FALSE, linewidth = .linewidth) +
+    wn_scales +
+    labs(x = "Best - Worst Value", y = "Pr(First Fixation to Best)", title = paste("Study", s)) +
+    .myPlot + strip_style + study_title + legend_right + theme(legend.direction = "vertical") +
+    coord_cartesian(ylim = c(0, 1), xlim = c(0, 40)) +
+    scale_y_continuous(breaks = seq(0, 1, by = 0.5), labels = scales::percent_format(accuracy = 1))
+}
+```
+
+```{r fix-duration}
+# Mean duration of a single fixation, by the type and value of the fixated box.
+# Facets are ordered N, B, P, like the attribute-level figure.
+pdata_dur <- long %>%
+  mutate(fix_type = factor(fix_type, levels = c("N", "B", "P"))) %>%
+  group_by(Study, Subject, WN, fix_type, fix_value) %>%
+  summarise(y_subject = mean(FixDur), .groups = "drop") %>%
+  group_by(Study, WN, fix_type, fix_value) %>%
+  summarise(y = mean(y_subject), se = sd(y_subject) / sqrt(n()), .groups = "drop")
+
+p_dur <- list()
+for (s in 1:2) {
+  p_dur[[s]] <- ggplot(pdata_dur %>% filter(Study == s),
+                       aes(x = fix_value, y = y, color = WN, shape = WN)) +
+    facet_wrap(~ fix_type, scales = "free_x", labeller = type_labels) +
+    geom_line(linewidth = .linewidth, position = wn_dodge) +
+    geom_pointrange(aes(ymin = y - se, ymax = y + se), size = pt_size, linewidth = .linewidth, position = wn_dodge) +
+    #stat_smooth(method = "lm", se = FALSE, linewidth = .linewidth) +
+    wn_scales +
+    labs(x = "Attribute Value", y = "Mean Fixation Duration (ms)") +
+    .myPlot + type_strip_style + legend_right + theme(legend.direction = "vertical") +
+    coord_cartesian(ylim = c(475, 850)) +
+    scale_x_continuous(breaks = x_attr_breaks) 
+}
+```
+
+```{r fix-share}
+# Share of a trial's fixations that went to a box, by its type and value.
+# Under uniform attention every box would get 0.25.
+pdata_share <- box_grid %>%
+  mutate(type = factor(type, levels = c("N", "B", "P"))) %>%
+  group_by(Study, Subject, WN, type, value) %>%
+  summarise(y_subject = mean(share), .groups = "drop") %>%
+  group_by(Study, WN, type, value) %>%
+  summarise(y = mean(y_subject), se = sd(y_subject) / sqrt(n()), .groups = "drop")
+
+p_share <- list()
+for (s in 1:2) {
+  p_share[[s]] <- ggplot(pdata_share %>% filter(Study == s),
+                         aes(x = value, y = y, color = WN, shape = WN)) +
+    facet_wrap(~ type, scales = "free_x", labeller = type_labels) +
+    geom_hline(yintercept = 0.25, linetype = "dotted", color = "grey50") +
+    geom_line(linewidth = .linewidth, position = wn_dodge) +
+    geom_pointrange(aes(ymin = y - se, ymax = y + se), size = pt_size, linewidth = .linewidth, position = wn_dodge) +
+    #stat_smooth(method = "lm", se = FALSE, linewidth = .linewidth) +
+    wn_scales +
+    labs(x = "Attribute Value", y = "Mean Share of Fixations") +
+    .myPlot + type_strip_style + legend_right + theme(legend.direction = "vertical") +
+    coord_cartesian(ylim = c(0.2, 0.3)) +
+    scale_y_continuous(breaks = seq(0, 1, by = 0.05), labels = scales::percent_format(accuracy = 1)) +
+    scale_x_continuous(breaks = x_attr_breaks)
+}
+```
+
+```{r fig-fixation, fig.width=2 * .figw, fig.height=3 * .figh}
+# 3 rows x 2 columns (Study 1, Study 2).
+fig_fix <- ((p_first[[1]] | p_first[[2]]) /
+            (p_dur[[1]]   | p_dur[[2]]) /
+            (p_share[[1]] | p_share[[2]])) +
+  plot_layout(guides = "collect")
+
+ggsave(file.path(fig_dir, "fixation_properties.pdf"), fig_fix, width = 2 * .figw, height = 3 * .figh)
+fig_fix
+```
+
+## Regressions
+
+One model per panel above, pooled across both studies with study crossed with
+every other predictor (Study 1 and Narrow are the reference levels, as in the
+psychometrics models). The first-fixation model uses uncorrelated random
+effects for the same reason as the RT model (the correlation went to -1).
+Fixation durations are right-skewed, so they are modeled on the log scale. The
+share model is a linear mixed model on the plotted quantity (share of the
+trial's fixations); this replaces the negative binomial count model from the
+earlier notebooks, which had a degenerate dispersion estimate. Its subject
+intercept variance is exactly zero by construction (every subject's shares
+average to 0.25 across the four boxes), so lme4 reports a singular fit there;
+the fixed effects are unaffected.
+
+```{r fix-regressions}
+if (RUN_REGRESSIONS) {
+  d_trial <- pas      %>% filter(!is.na(FirstFixBest)) %>% mutate(Study = factor(Study))
+  d_fix   <- long     %>% filter(FixDur > 0)           %>% mutate(Study = factor(Study))
+  d_box   <- box_grid %>% mutate(Study = factor(Study))
+
+  fit_first <- glmmTMB(
+    FirstFixBest ~ Difficulty10 * WN * Study + (1 + Difficulty10 || Subject),
+    data = d_trial, family = binomial
+  )
+
+  fit_dur <- lmer(
+    log(FixDur) ~ fix_type * fix_value10 * WN * Study + (1 | Subject),
+    data = d_fix
+  )
+
+  fit_share <- lmer(
+    share ~ type * value10 * WN * Study + (1 | Subject),
+    data = d_box
+  )
+
+  # One panel per model. Value effects on the share are a few thousandths, so
+  # that panel gets four decimals.
+  tab <- list(
+    "Panel A: First Fixation to Best" = freq_columns(fit_first, "Frequentist (glmmTMB)"),
+    "Panel B: log Fixation Duration"  = freq_columns(fit_dur,   "Frequentist (lme4)"),
+    "Panel C: Share of Fixations"     = freq_columns(fit_share, "Frequentist (lme4)", digits = 4)
+  )
+  note <- sd_note(list("Panel A" = sds_freq(fit_first), "Panel B" = sds_freq(fit_dur),
+                       "Panel C" = sds_freq(fit_share)))
+  save_tex(tab, "fixation_properties", note)
+}
+```
+
+## Text Output
+
+The statistics quoted in the Fixation Process paragraphs of the paper.
+
+```{r text-fixdur-type}
+if (RUN_REGRESSIONS) {
+  # Fixation duration by attribute type (log units, vs. appetitive) from the
+  # pooled log-duration model, per study. Study 1 is the reference level, so
+  # Study 2 adds the type x Study2 interaction. Evaluated at the model's
+  # reference point (Narrow, value 0).
+  out <- c()
+  for (s in 1:2) {
+    for (tt in c("N", "B")) {
+      terms <- c(paste0("fix_type", tt), if (s == 2) paste0("fix_type", tt, ":Study2"))
+      out <- c(out, paste0("$\\beta^{\\text{", tt, " - P}}_{\\text{Study ", s, "}} = ", fmt_coef(fit_dur, terms), "$"))
+    }
+  }
+  save_text(paste(out, collapse = ", "), "fixdur_type")
+}
+```
+
+```{r text-fixdur-value}
+if (RUN_REGRESSIONS) {
+  # Slope of log fixation duration on attribute value (per 10 points), per
+  # type and study. P is the reference type and Study 1 the reference study,
+  # so N and B add their type x value interaction and Study 2 adds the Study2
+  # interactions.
+  out <- c()
+  for (s in 1:2) {
+    for (tt in c("N", "B", "P")) {
+      terms <- c("fix_value10",
+                 if (tt != "P") paste0("fix_type", tt, ":fix_value10"),
+                 if (s == 2) "fix_value10:Study2",
+                 if (s == 2 && tt != "P") paste0("fix_type", tt, ":fix_value10:Study2"))
+      out <- c(out, paste0("$\\beta^{\\text{value, ", tt, "}}_{\\text{Study ", s, "}} = ", fmt_coef(fit_dur, terms), "$"))
+    }
+  }
+  save_text(paste(out, collapse = ", "), "fixdur_value")
+}
+```
+
+```{r text-fixdur-range}
+if (RUN_REGRESSIONS) {
+  # Wide minus Narrow log fixation duration per study, from the pooled model
+  # (Study 2 adds the WNWide:Study2 interaction).
+  save_text(paste0(
+    "$\\Delta^{\\text{Wide - Narrow}}_{\\text{Study 1}} = ", fmt_coef(fit_dur, "WNWide"), "$, ",
+    "$\\Delta^{\\text{Wide - Narrow}}_{\\text{Study 2}} = ", fmt_coef(fit_dur, c("WNWide", "WNWide:Study2")), "$"
+  ), "fixdur_range")
+}
+```
+
+```{r text-share-value}
+if (RUN_REGRESSIONS) {
+  # Slope of fixation share on attribute value (share per 10 value points),
+  # per type and study, from the pooled share model. P is the reference type
+  # and Study 1 the reference study, so N and B add their type x value
+  # interaction and Study 2 adds the Study2 interactions. Four decimals,
+  # since shares move by fractions of a percentage point.
+  out <- c()
+  for (s in 1:2) {
+    for (tt in c("N", "B", "P")) {
+      terms <- c("value10",
+                 if (tt != "P") paste0("type", tt, ":value10"),
+                 if (s == 2) "value10:Study2",
+                 if (s == 2 && tt != "P") paste0("type", tt, ":value10:Study2"))
+      out <- c(out, paste0("$\\beta^{\\text{value, ", tt, "}}_{\\text{Study ", s, "}} = ", fmt_coef(fit_share, terms, digits = 4), "$"))
+    }
+  }
+  save_text(paste(out, collapse = ", "), "share_value")
+}
+```
+
+```{r text-share-type}
+if (RUN_REGRESSIONS) {
+  # Mean share of fixations per subject and attribute type (percentage
+  # points), then paired t-tests P vs B and B vs N within each study.
+  sh_subj <- box_grid %>%
+    group_by(Study, Subject, type) %>%
+    summarise(sh = 100 * mean(share), .groups = "drop") %>%
+    pivot_wider(names_from = type, values_from = sh)
+  out <- c()
+  for (s in 1:2) {
+    d <- sh_subj %>% filter(Study == s)
+    out <- c(out,
+      fmt_ttest(d$P, d$B, sup = "\\text{P - B}", sub = paste("Study", s), unit = "\\ \\text{pp}", paired = TRUE),
+      fmt_ttest(d$B, d$N, sup = "\\text{B - N}", sub = paste("Study", s), unit = "\\ \\text{pp}", paired = TRUE))
+  }
+  save_text(paste(out, collapse = "; "), "share_type")
+}
+```
+
+---
+
+# Option-Level Attention
+
+The standard option-level attentional biases, as a benchmark for the
+attribute-level results.
+
+## Net fixation bias
+
+Corrected choice is the actual choice minus the probability of choosing left
+predicted from value alone, so it is zero on average and any dependence on
+dwell time is attention doing work beyond value. The value-only model is one
+plain logistic regression per study.
+
+```{r corrected-choice}
+pas$CorrChoice <- NA_real_
+for (s in 1:2) {
+  rows <- pas$Study == s
+  value_only <- glm(ChooseL ~ Diff, data = pas[rows, ], family = binomial)
+  pas$CorrChoice[rows] <- pas$ChooseL[rows] -
+    predict(value_only, newdata = pas[rows, ], type = "response")
+}
+
+# Bin net dwell time (left minus right, seconds) into 0.5 s bins, pooling the
+# tails beyond +/- 3 s. Each bin is plotted at its mean net dwell time.
+bin_breaks <- c(-Inf, seq(-3, 3, by = 0.5), Inf)
+pas <- pas %>% mutate(DwellDiff_bin = cut(DwellDiff, breaks = bin_breaks))
+
+pdata_netfix <- pas %>%
+  filter(!is.na(DwellDiff_bin)) %>%
+  group_by(Study, Subject, WN, DwellDiff_bin) %>%
+  summarise(y_subject = mean(CorrChoice), x_subject = mean(DwellDiff), .groups = "drop") %>%
+  group_by(Study, WN, DwellDiff_bin) %>%
+  summarise(
+    x  = mean(x_subject),
+    y  = mean(y_subject),
+    se = sd(y_subject) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# One plot per study. Only net dwell times between -2 and 2 s are shown: beyond
+# that the bins are sparse and just add noise. coord_cartesian() crops the view
+# without dropping the data, so the lines still run out to the edge of the plot.
+# The x-axis ends exactly at -2 and 2 (no padding); y keeps its usual padding.
+# This row has no legend of its own: its line-style key differs from the fitted
+# curves below, so patchwork couldn't merge the two. The Range legend comes
+# from the last-fixation row.
+p_netfix <- list()
+for (s in 1:2) {
+  p_netfix[[s]] <- ggplot(pdata_netfix %>% filter(Study == s),
+                          aes(x = x, y = y, color = WN, shape = WN)) +
+    geom_vline(xintercept = 0, linetype = "dotted", color = "grey50") +
+    geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
+    geom_line(linewidth = .linewidth) +
+    geom_pointrange(aes(ymin = y - se, ymax = y + se), size = pt_size, linewidth = .linewidth) +
+    wn_scales +
+    labs(x = "Net Dwell Time to Left (s)", y = "Corrected Pr(Choose Left)", title = paste("Study", s)) +
+    .myPlot + strip_style + study_title + legend_right +
+    coord_cartesian(xlim = c(-1.25, 1.25), expand = c(top = TRUE, right = FALSE, bottom = TRUE, left = FALSE)) +
+    scale_y_continuous(breaks = seq(-0.2, 0.2, by = 0.1), labels = scales::percent_format(accuracy = 1)) 
+}
+```
+
+## Last fixation bias
+
+Probability of choosing the option that was fixated last, as a function of how
+much better that option was than the other one, split by the attribute type of
+the box that was fixated last.
+
+```{r last-fixation}
+pdata_last <- pas %>%
+  filter(!is.na(LastSide)) %>%
+  mutate(LastType = factor(LastType, levels = c("N", "B", "P"))) %>%
+  group_by(Study, Subject, WN, LastType, RelDiff_last) %>%
+  summarise(y_subject = mean(ChooseLast), .groups = "drop") %>%
+  group_by(Study, WN, LastType, RelDiff_last) %>%
+  summarise(y = mean(y_subject), se = sd(y_subject) / sqrt(n()), .groups = "drop")
+
+# Facets are the attribute type of the box that was fixated last.
+p_last <- list()
+for (s in 1:2) {
+  p_last[[s]] <- ggplot(pdata_last %>% filter(Study == s),
+                        aes(x = RelDiff_last, y = y, color = WN, shape = WN)) +
+    facet_wrap(~ LastType, labeller = type_labels) +
+    geom_vline(xintercept = 0,   linetype = "dotted", color = "grey50") +
+    geom_hline(yintercept = 0.5, linetype = "dotted", color = "grey50") +
+    geom_line(linewidth = .linewidth, position = wn_dodge) +
+    geom_pointrange(aes(ymin = y - se, ymax = y + se), size = pt_size, linewidth = .linewidth, position = wn_dodge) +
+    #stat_smooth(method = "glm", method.args = list(family = "binomial"), se = FALSE, linewidth = .linewidth) +
+    wn_scales +
+    labs(x = "Value Difference (Last Fixated - Other)", y = "Pr(Choose Last Fixated)") +
+    .myPlot + type_strip_style + legend_right
+}
+```
+
+```{r fig-option-level, fig.width=2 * .figw, fig.height=2 * .figh}
+# 2 rows x 2 columns (Study 1, Study 2).
+fig_option <- ((p_netfix[[1]] | p_netfix[[2]]) /
+               (p_last[[1]]   | p_last[[2]])) +
+  plot_layout(guides = "collect")
+
+ggsave(file.path(fig_dir, "option_level_attention.pdf"), fig_option, width = 2 * .figw, height = 2 * .figh)
+fig_option
+```
+
+## Regressions
+
+Both pooled across studies, with study crossed with every other predictor
+(Study 1 and Narrow are the reference levels). Net fixation bias: choice on
+value difference, net dwell time, and range, with subject random slopes on
+value. Last fixation bias: choosing the last-fixated option on its relative
+value, the type of the last-fixated box, and range.
+
+```{r option-regressions}
+if (RUN_REGRESSIONS) {
+  d <- pas %>% mutate(Study = factor(Study))
+
+  fit_netfix <- glmmTMB(
+    ChooseL ~ Diff10 * DwellDiff * WN * Study + (1 + Diff10 | Subject),
+    data = d, family = binomial
+  )
+
+  fit_last <- glmmTMB(
+    ChooseLast ~ RelDiff10_last * LastType * WN * Study + (1 + RelDiff10_last | Subject),
+    data = d %>% filter(!is.na(LastSide)), family = binomial
+  )
+
+  # One panel per model.
+  tab <- list(
+    "Panel A: Choose Left"         = freq_columns(fit_netfix, "Frequentist (glmmTMB)"),
+    "Panel B: Choose Last Fixated" = freq_columns(fit_last,   "Frequentist (glmmTMB)")
+  )
+  note <- sd_note(list("Panel A" = sds_freq(fit_netfix), "Panel B" = sds_freq(fit_last)))
+  save_tex(tab, "option_level_attention", note)
+}
+```
+
+## Text Output
+
+The statistics quoted in the Option-Level Attention paragraphs of the paper.
+
+```{r text-netfix-dwell}
+if (RUN_REGRESSIONS) {
+  # Effect of net dwell time to left (log-odds per s) on choosing left,
+  # holding value constant, per study. Study 2 adds the DwellDiff:Study2
+  # interaction.
+  save_text(paste0(
+    "$\\beta^{\\text{Dwell}}_{\\text{Study 1}} = ", fmt_coef(fit_netfix, "DwellDiff"), "$, ",
+    "$\\beta^{\\text{Dwell}}_{\\text{Study 2}} = ", fmt_coef(fit_netfix, c("DwellDiff", "DwellDiff:Study2")), "$"
+  ), "netfix_dwell")
+}
+```
+
+```{r text-netfix-range}
+if (RUN_REGRESSIONS) {
+  # Wide minus Narrow difference in the net-dwell effect, per study (Study 2
+  # adds the three-way interaction with Study2).
+  save_text(paste0(
+    "$\\beta^{\\text{Dwell} \\times \\text{Wide}}_{\\text{Study 1}} = ", fmt_coef(fit_netfix, "DwellDiff:WNWide"), "$, ",
+    "$\\beta^{\\text{Dwell} \\times \\text{Wide}}_{\\text{Study 2}} = ", fmt_coef(fit_netfix, c("DwellDiff:WNWide", "DwellDiff:WNWide:Study2")), "$"
+  ), "netfix_range")
+}
+```
+
+```{r text-lastfix-bias}
+if (RUN_REGRESSIONS) {
+  # Log-odds of choosing the last-fixated option at equal value, for every
+  # type x range cell and study (P, Narrow and Study 1 are the reference
+  # levels; other cells add the matching main effects and interactions).
+  cells <- tibble()
+  for (s in 1:2) {
+    for (rng in c("Narrow", "Wide")) {
+      for (tt in c("P", "N", "B")) {
+        terms <- c("(Intercept)",
+                   if (tt != "P") paste0("LastType", tt),
+                   if (rng == "Wide") "WNWide",
+                   if (tt != "P" && rng == "Wide") paste0("LastType", tt, ":WNWide"),
+                   if (s == 2) "Study2",
+                   if (s == 2 && tt != "P") paste0("LastType", tt, ":Study2"),
+                   if (s == 2 && rng == "Wide") "WNWide:Study2",
+                   if (s == 2 && tt != "P" && rng == "Wide") paste0("LastType", tt, ":WNWide:Study2"))
+        ci <- coef_ci(fit_last, terms)
+        cells <- bind_rows(cells, tibble(Study = s, type = tt, WN = rng,
+                                         estimate = ci[["estimate"]], lo = ci[["lo"]], hi = ci[["hi"]]))
+      }
+    }
+  }
+  cells
+
+  # Report the smallest and largest cell of each study.
+  out <- c()
+  for (s in 1:2) {
+    d <- cells %>% filter(Study == s)
+    for (r in list(d[which.min(d$estimate), ], d[which.max(d$estimate), ])) {
+      out <- c(out, paste0("$\\beta^{\\text{Last, ", r$type, ", ", r$WN, "}}_{\\text{Study ", s, "}} = ", fmt_ci(r$estimate, r$lo, r$hi), "$"))
+    }
+  }
+  save_text(paste(out, collapse = ", "), "lastfix_bias")
+}
+```
+
+---
+
+# Attribute-Level Attention
+
+The central analysis. A **signed attention weight** is the effect of one second
+of dwell on a box on the log-odds of choosing that box's option, holding the
+value difference constant. One weight per (type x value) cell, with partial
+pooling: every subject gets their own weight per cell, and we plot the
+population mean. Positive means attention pulls choice toward the attended
+option; negative means it pushes choice away.
+
+Narrow and Wide have partly different value sets, so there is one model per
+range condition. Each model pools both studies: Study 1 is the reference level,
+and every value channel and cell weight gets a `:Study2` interaction, so a
+Study 2 weight is the Study 1 weight plus that interaction.
+
+These are the only Bayesian models in the notebook. With a random slope per
+subject for every one of the 18 cells, maximum likelihood (glmmTMB) did not
+converge and pushed several cell variances to zero; the weakly informative
+priors and partial pooling in brms keep the cell weights well behaved.
+
+## Design matrices
+
+Per trial: choice, study, the three signed value channels (`SV_P`, `SV_N`,
+`SV_B`), and signed dwell time in every (type x value) cell.
+
+```{r flex-design}
+build_flex_dat <- function(range) {
+  bl <- boxlong %>% filter(WN == range)
+  ps <- pas     %>% filter(WN == range)
+
+  # Signed dwell per cell. One column per cell, 0 where that cell wasn't on screen.
+  flex_design <- bl %>%
+    group_by(Subject, Trial, cell) %>%
+    summarise(sd = sum(signed_dwell), .groups = "drop") %>%
+    pivot_wider(names_from = cell, values_from = sd, values_fill = 0)
+
+  # Signed value per attribute type. These three sum to Diff / 10.
+  value_design <- bl %>%
+    group_by(Subject, Trial, type) %>%
+    summarise(SV = sum(signed_value), .groups = "drop") %>%
+    pivot_wider(names_from = type, values_from = SV,
+                names_prefix = "SV_", values_fill = 0)
+
+  ps %>%
+    transmute(Subject, Trial, ChooseL, Study = factor(Study)) %>%
+    left_join(value_design, by = c("Subject", "Trial")) %>%
+    left_join(flex_design,  by = c("Subject", "Trial"))
+}
+
+# Population weight for every value channel and cell, each crossed with study,
+# plus subject-level random slopes on the value channels and on every cell
+# (one set per subject; each subject is in only one study).
+build_flex_formula <- function(dat) {
+  value_cols <- c("SV_P", "SV_N", "SV_B")
+  cell_cols  <- setdiff(names(dat), c("Subject", "Trial", "ChooseL", "Study", value_cols))
+  as.formula(paste(
+    "ChooseL ~ (", paste(c(value_cols, cell_cols), collapse = " + "), ") * Study",
+    "+ (0 + SV_P + SV_N + SV_B | Subject)",
+    "+ (0 +", paste(cell_cols, collapse = " + "), "| Subject)"
+  ))
+}
+```
+
+## Fits
+
+Sampling each of these takes many hours. `code/fitting/sample_pooled_attention_weights.R`
+runs exactly this chunk from a terminal (so a closed R session can't kill it)
+and leaves the caches in `notebooks/brm_fits/`; after that the notebook only
+loads them.
+
+```{r flex-fit-by-range}
+range_files <- c(
+  Narrow = "flex_attention_weights_pooled_narrow",
+  Wide   = "flex_attention_weights_pooled_wide"
+)
+
+flex_fit_range <- list()
+for (rng in c("Narrow", "Wide")) {
+  flex_dat <- build_flex_dat(rng)
+  flex_fit_range[[rng]] <- load_or_fit(
+    range_files[[rng]],
+    formula = build_flex_formula(flex_dat),
+    data    = flex_dat,
+    family  = bernoulli(),
+    prior   = brms_priors,
+    chains  = BRMS_CHAINS, iter = 4000, seed = BRMS_SEED,
+    control = list(adapt_delta = 0.95, max_treedepth = 12)
+  )
+}
+```
+
+## Figures
+
+```{r flex-summary}
+# Pull the population-level draws out of each fit once (the fits are big, so
+# we don't want to go back to them for every cell).
+flex_draws <- list()
+for (rng in names(flex_fit_range)) {
+  if (!is.null(flex_fit_range[[rng]])) {
+    flex_draws[[rng]] <- as_draws_df(flex_fit_range[[rng]], variable = "^b_", regex = TRUE)
+  }
+}
+
+# Draws of one cell weight, e.g. aw_draws("Narrow", "N_neg30", 2). Study 1 is
+# the reference level, so Study 2 is the Study 1 draws plus the cell's Study 2
+# interaction.
+aw_draws <- function(range, cell, study) {
+  d <- flex_draws[[range]]
+  if (study == 1) d[[paste0("b_", cell)]] else d[[paste0("b_", cell)]] + d[[paste0("b_", cell, ":Study2")]]
+}
+
+# Median and 95% HDI of every cell weight in one range condition, by study,
+# with the cell name parsed back into a type and a value for plotting.
+summarise_flex_weights <- function(range) {
+  cells <- names(flex_draws[[range]]) %>% str_subset("^b_[PNB]_(neg|pos)[0-9]+$") %>% str_remove("^b_")
+  out <- tibble()
+  for (s in 1:2) {
+    for (cell in cells) {
+      x <- aw_draws(range, cell, s)
+      h <- bayestestR::hdi(x, ci = 0.95)
+      out <- bind_rows(out, tibble(Study = s, WN = range, term = cell,
+                                   estimate = median(x), lo = h$CI_low, hi = h$CI_high))
+    }
+  }
+  out %>% mutate(
+    type  = factor(str_sub(term, 1, 1), levels = c("N", "B", "P")),
+    value = as.numeric(str_extract(term, "[0-9]+$")) * if_else(str_detect(term, "_neg"), -1, 1)
+  )
+}
+
+# Signed attention weights by type and value, Narrow and Wide overlaid (one study).
+plot_weights_by_range <- function(weights, title) {
+  ggplot(weights, aes(x = value, y = estimate, color = WN, shape = WN)) +
+    facet_wrap(~ type, scales = "free_x", labeller = type_labels) +
+    geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
+    geom_line(linewidth = .linewidth, position = wn_dodge) +
+    geom_pointrange(aes(ymin = lo, ymax = hi), size = pt_size, linewidth = .linewidth, position = wn_dodge) +
+    #stat_smooth(method = "lm", se = FALSE, linewidth = .linewidth) +
+    wn_scales +
+    labs(x = "Attribute Value", y = "Attention Weight", title = title) +
+    .myPlot + type_strip_style + study_title + legend_right + theme(legend.direction = "vertical") +
+    coord_cartesian(ylim = c(-0.5, 0.5)) +
+    scale_x_continuous(breaks = x_attr_breaks)
+}
+```
+
+```{r flex-plots}
+# Cell weights of both range conditions, then one plot per study.
+weights_range <- tibble()
+for (rng in names(flex_draws)) {
+  weights_range <- bind_rows(weights_range, summarise_flex_weights(rng))
+}
+
+p_weights_range <- list()
+if (nrow(weights_range) > 0) {
+  weights_range <- weights_range %>% mutate(WN = factor(WN, levels = c("Narrow", "Wide")))
+  for (s in 1:2) {
+    key <- paste0("Study ", s)
+    p_weights_range[[key]] <- plot_weights_by_range(weights_range %>% filter(Study == s), title = key)
+  }
+}
+```
+
+```{r fig-attribute-level, fig.width=2 * .figw, fig.height=1 * .figh}
+# A missing fit leaves an empty panel rather than breaking the layout.
+get_or_spacer <- function(plots, key) {
+  if (is.null(plots[[key]])) plot_spacer() else plots[[key]]
+}
+
+# 1 row x 2 columns (Study 1, Study 2). Only saved when the fits exist, so a
+# figures-only pass without the caches doesn't overwrite the paper's figure.
+fig_attr <- (get_or_spacer(p_weights_range, "Study 1") | get_or_spacer(p_weights_range, "Study 2")) +
+  plot_layout(guides = "collect")
+
+if (length(p_weights_range) == 2) {
+  ggsave(file.path(fig_dir, "attribute_level_attention.pdf"), fig_attr, width = 2 * .figw, height = 1 * .figh)
+}
+fig_attr
+```
+
+## Tables
+
+Population-level coefficients from the two brms fits (posterior median and 95%
+HDI), one table per range condition. Cells are labeled "type, value"; the
+"× Study 2" column is the Study 2 minus Study 1 difference. The Bayesian R2
+takes a minute or two per fit.
+
+```{r flex-tables}
+if (RUN_REGRESSIONS && length(flex_draws) == 2) {
+  for (rng in c("Narrow", "Wide")) {
+    fit  <- flex_fit_range[[rng]]
+    tab  <- table_columns(order_cells(tidy_brms(fit)), gof_brms(fit), study_columns)
+    note <- sd_note(list(sds_brms(fit)), intro = "Random-effect SDs across subjects (posterior medians).")
+    # 22 rows would run off the page with the intervals underneath, and two
+    # columns leave room for them on the same line.
+    save_tex(tab, paste0("attribute_level_attention_weights_", tolower(rng)), note, ci_inline = TRUE)
+  }
+}
+```
+
+## Text Output
+
+The attention weights quoted in the Attribute-Level Attention paragraphs of the
+paper. Each snippet reports one attribute value per range condition, for both
+studies, as `fmt_post(aw_draws(range, cell, study))`.
+
+---
+
+# Range Sensitivity
+
+A value-representation test rather than an attention test: does a given value
+difference move choice more in the Narrow range than in the Wide range? Choice
+is regressed on the three per-type value channels, each crossed with range and
+study, with subject-level random intercepts and slopes on the three channels.
+Range normalization predicts steeper slopes in Narrow. This model has only four
+random effects per subject, so like the other small models it is fit by
+maximum likelihood (glmmTMB) rather than brms.
+
+```{r value-fit}
+# Signed value per type (value only, no dwell time), for every trial.
+value_design <- boxlong %>%
+  group_by(Subject, Trial, type) %>%
+  summarise(SV = sum(signed_value), .groups = "drop") %>%
+  pivot_wider(names_from = type, values_from = SV, names_prefix = "SV_", values_fill = 0)
+
+val_dat <- pas %>%
+  transmute(Study = factor(Study), Subject, Trial, ChooseL, WN) %>%
+  left_join(value_design, by = c("Subject", "Trial"))
+
+fit_val <- glmmTMB(
+  ChooseL ~ (SV_P + SV_N + SV_B) * WN * Study + (1 + SV_P + SV_N + SV_B | Subject),
+  data = val_dat, family = binomial
+)
+```
+
+```{r value-readout}
+# Narrow and Study 1 are the reference levels, so each (type, range, study)
+# slope is a sum of coefficients:
+#   Narrow, Study 1: b_SV
+#   Wide,   Study 1: b_SV + b_SV:WNWide
+#   Narrow, Study 2: b_SV + b_SV:Study2
+#   Wide,   Study 2: b_SV + b_SV:WNWide + b_SV:Study2 + b_SV:WNWide:Study2
+# "Wide - Narrow" is the Wide terms that are not in the Narrow sum.
+slopes <- tibble()
+for (s in 1:2) {
+  for (tt in c("N", "B", "P")) {
+    sv <- paste0("SV_", tt)
+    narrow_terms <- c(sv, if (s == 2) paste0(sv, ":Study2"))
+    wide_terms   <- c(narrow_terms, paste0(sv, ":WNWide"), if (s == 2) paste0(sv, ":WNWide:Study2"))
+    for (q in c("Narrow", "Wide", "Wide - Narrow")) {
+      terms <- switch(q, "Narrow" = narrow_terms, "Wide" = wide_terms,
+                      "Wide - Narrow" = setdiff(wide_terms, narrow_terms))
+      ci <- coef_ci(fit_val, terms)
+      slopes <- bind_rows(slopes, tibble(
+        Study = paste0("Study ", s), type = tt, quantity = q,
+        estimate = ci[["estimate"]], lo = ci[["lo"]], hi = ci[["hi"]]
+      ))
+    }
+  }
+}
+slopes <- slopes %>% mutate(type = factor(type, levels = c("N", "B", "P")))
+
+slopes %>% mutate(across(c(estimate, lo, hi), \(x) round(x, 3)))
+```
+
+```{r fig-range-sensitivity, fig.width=2 * .figw, fig.height=1 * .figh}
+pdata_val <- slopes %>%
+  filter(quantity %in% c("Narrow", "Wide")) %>%
+  mutate(WN = factor(quantity, levels = c("Narrow", "Wide")),
+         Study = str_remove(Study, "Study "))
+
+p_val <- ggplot(pdata_val, aes(x = type, y = estimate, color = WN, shape = WN)) +
+  facet_wrap(~ Study, labeller = study_labels) +
+  geom_pointrange(aes(ymin = lo, ymax = hi), size = 0.8, linewidth = .linewidth,
+                  position = position_dodge(width = 0.5)) +
+  wn_scales +
+  labs(x = "Attribute Type", y = "Range Sensitivity (Slope)") + #(log-odds per 10 points)
+  .myPlot + strip_style + legend_right + theme(legend.direction = "vertical")
+
+# 1 row x 2 columns (Study 1, Study 2).
+ggsave(file.path(fig_dir, "range_sensitivity.pdf"), p_val, width = 2 * .figw, height = 1 * .figh)
+p_val
+```
+
+## Table
+
+```{r value-table}
+if (RUN_REGRESSIONS) {
+  save_tex(freq_columns(fit_val, "Frequentist (glmmTMB)"), "range_sensitivity",
+           sd_note(list(sds_freq(fit_val))))
+}
+```
+
+## Text Output
+
+The statistic quoted in the Range Sensitivity paragraph of the paper.
+
+```{r text-range-sensitivity}
+if (RUN_REGRESSIONS) {
+  # Wide minus Narrow value sensitivity (log-odds per 10 points) per type and
+  # study, taken from the `slopes` table above (the SV x WNWide interaction,
+  # plus its Study2 interaction for Study 2).
+  out <- c()
+  for (s in 1:2) {
+    for (tt in c("N", "B", "P")) {
+      r <- slopes %>% filter(Study == paste("Study", s), type == tt, quantity == "Wide - Narrow")
+      out <- c(out, paste0("$\\Delta^{\\text{Wide - Narrow}, ", tt, "}_{\\text{Study ", s, "}} = ",
+                           fmt_ci(r$estimate, r$lo, r$hi), "$"))
+    }
+  }
+  # One statistic per line (a blank line between them).
+  save_text(paste(out, collapse = "\n\n"), "range_sensitivity_diff")
+}
+```
+
+---
+
+# Extra Analyses
+
+Analyses that are not in the paper, kept in case we want them again. Nothing
+in this section runs unless the switch below is TRUE.
+
+```{r extra-switch}
+run_extra_analyses <- FALSE
+```
+
+## Attention weights pooled across range conditions
+
+The cell-weight model from the Attribute-Level Attention section, but fit per
+study on both range conditions together (so a cell's weight is averaged over
+the two ranges it can appear in), without study interactions. These were the
+fits used before the by-range models. The cached fits keep the file names from
+the original per-study notebooks.
+
+```{r extra-flex-fit}
+if (run_extra_analyses) {
+  # Like build_flex_dat(), but one study, both ranges, and no Study column.
+  build_flex_dat_allranges <- function(study) {
+    bl <- boxlong %>% filter(Study == study)
+    ps <- pas     %>% filter(Study == study)
+    flex_design <- bl %>%
+      group_by(Subject, Trial, cell) %>%
+      summarise(sd = sum(signed_dwell), .groups = "drop") %>%
+      pivot_wider(names_from = cell, values_from = sd, values_fill = 0)
+    value_design <- bl %>%
+      group_by(Subject, Trial, type) %>%
+      summarise(SV = sum(signed_value), .groups = "drop") %>%
+      pivot_wider(names_from = type, values_from = SV, names_prefix = "SV_", values_fill = 0)
+    ps %>%
+      select(Subject, Trial, ChooseL) %>%
+      left_join(value_design, by = c("Subject", "Trial")) %>%
+      left_join(flex_design,  by = c("Subject", "Trial"))
+  }
+
+  # Like build_flex_formula(), without the study interactions.
+  build_flex_formula_allranges <- function(dat) {
+    value_cols <- c("SV_P", "SV_N", "SV_B")
+    cell_cols  <- setdiff(names(dat), c("Subject", "Trial", "ChooseL", value_cols))
+    as.formula(paste(
+      "ChooseL ~", paste(value_cols, collapse = " + "), "+",
+      paste(cell_cols, collapse = " + "),
+      "+ (0 + SV_P + SV_N + SV_B | Subject)",
+      "+ (0 +", paste(cell_cols, collapse = " + "), "| Subject)"
+    ))
+  }
+
+  # The Study 1 fit was sampled with adapt_delta = 0.99, the Study 2 fit with 0.95.
+  flex_files <- c(
+    "Study 1" = "flex_attention_weights_typeval_partpool",
+    "Study 2" = "PAS4_flex_attention_weights_typeval_partpool"
+  )
+  flex_fit <- list()
+  for (s in 1:2) {
+    key <- paste0("Study ", s)
+    flex_dat <- build_flex_dat_allranges(s)
+    flex_fit[[key]] <- load_or_fit(
+      flex_files[[key]],
+      formula = build_flex_formula_allranges(flex_dat),
+      data    = flex_dat,
+      family  = bernoulli(),
+      prior   = brms_priors,
+      chains  = BRMS_CHAINS, iter = 4000, seed = BRMS_SEED,
+      control = list(adapt_delta = ifelse(s == 1, 0.99, 0.95), max_treedepth = 12)
+    )
+  }
+}
+```
+
+```{r extra-flex-plots, fig.width=2 * .figw, fig.height=1 * .figh}
+if (run_extra_analyses) {
+  # Cell weights of one fit (no study interactions here, so tidy_brms is enough).
+  summarise_flex_weights_allranges <- function(fit) {
+    tidy_brms(fit) %>%
+      filter(str_detect(term, "^[PNB]_(neg|pos)[0-9]+$")) %>%
+      transmute(
+        term, estimate, lo = conf.low, hi = conf.high,
+        type  = factor(str_sub(term, 1, 1), levels = c("N", "B", "P")),
+        value = as.numeric(str_extract(term, "[0-9]+$")) * if_else(str_detect(term, "_neg"), -1, 1)
+      )
+  }
+
+  # Signed attention weights by type and value (one study). These fits pool the
+  # two range conditions, so everything is drawn in black.
+  plot_weights <- function(weights, title) {
+    ggplot(weights, aes(x = value, y = estimate)) +
+      facet_wrap(~ type, scales = "free_x", labeller = type_labels) +
+      geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
+      geom_line(linewidth = .linewidth) +
+      geom_pointrange(aes(ymin = lo, ymax = hi), size = pt_size, linewidth = .linewidth, color = "black") +
+      labs(x = "Attribute Value", y = "Attention Weight", title = title) +
+      .myPlot + type_strip_style + study_title + legend_right + theme(legend.direction = "vertical") +
+      scale_x_continuous(breaks = x_attr_breaks)
+  }
+
+  p_weights <- list()
+  for (key in names(flex_fit)) {
+    if (!is.null(flex_fit[[key]])) {
+      p_weights[[key]] <- plot_weights(summarise_flex_weights_allranges(flex_fit[[key]]), title = key)
+    }
+  }
+  (get_or_spacer(p_weights, "Study 1") | get_or_spacer(p_weights, "Study 2"))
+}
+```
+
+```{r extra-flex-tables}
+if (run_extra_analyses) {
+  # One column per study (these fits have no moderators, so every coefficient
+  # is a "ref" one).
+  tab <- list()
+  sds <- list()
+  for (key in names(flex_fit)) {
+    fit <- flex_fit[[key]]
+    tab <- c(tab, table_columns(order_cells(tidy_brms(fit)), gof_brms(fit), c("ref" = key)))
+    sds[[key]] <- sds_brms(fit)
+  }
+  save_tex(tab, "attribute_level_attention_weights",
+           sd_note(sds, intro = "Random-effect SDs across subjects (posterior medians)."), ci_inline = TRUE)
+}
+```
+
+## Range sensitivity with brms
+
+The range-sensitivity model fit with brms instead of glmmTMB (one fit per
+study, no study interactions), as in the earlier version of this notebook,
+kept for comparison with the glmmTMB fit above.
+
+```{r extra-value-fit-brms}
+if (run_extra_analyses) {
+  val_files <- c(
+    "Study 1" = "value_sensitivity_by_range",
+    "Study 2" = "PAS4_value_sensitivity_by_range"
+  )
+  val_fit_brms <- list()
+  for (s in 1:2) {
+    key <- paste0("Study ", s)
+    val_fit_brms[[key]] <- load_or_fit(
+      val_files[[key]],
+      formula = ChooseL ~ (SV_P + SV_N + SV_B) * WN + (1 + SV_P + SV_N + SV_B | Subject),
+      data    = val_dat %>% filter(Study == s),
+      family  = bernoulli(),
+      prior   = brms_priors,
+      chains  = BRMS_CHAINS, iter = 2000, seed = BRMS_SEED,
+      control = list(adapt_delta = 0.95)
+    )
+  }
+  lapply(val_fit_brms, tidy_brms)
+}
+```

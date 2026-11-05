@@ -1,17 +1,18 @@
 #!/bin/bash
-# SLURM array job for the Alliance clusters (Fir or Rorqual): the ten brms
+# SLURM array job for the Alliance clusters (Nibi, Fir or Rorqual): the ten brms
 # attention-weight fits on the Bayesian model variants' simulated choices, one
 # variant x range per task (see compute_canada_attention_weights.R). Each task
 # takes one chiplet of a node (8 cores: four chains, two threads each).
 # Everything lives in one folder on the cluster, attention_fits in scratch:
 #
+#   Nibi:     beum@nibi.alliancecan.ca     ~/scratch/attention_fits
 #   Fir:      beum@fir.alliancecan.ca      ~/scratch/attention_fits
 #   Rorqual:  beum@rorqual.alliancecan.ca  ~/links/scratch/attention_fits
 #
-# 1. Laptop, from the project root (Fir shown; for Rorqual replace the host
+# 1. Laptop, from the project root (Nibi shown; for Rorqual replace the host
 #    and put links/ in front of scratch/):
 #
-#      rsync -av code/fitting/compute_canada_attention_weights.R code/fitting/compute_canada_attention_weights.sh results/compute_canada/inputs/*.rds beum@fir.alliancecan.ca:scratch/attention_fits/
+#      rsync -av code/fitting/compute_canada_attention_weights.R code/fitting/compute_canada_attention_weights.sh results/compute_canada/inputs/*.rds beum@nibi.alliancecan.ca:scratch/attention_fits/
 #
 # 2. Cluster. The setup installs the R packages and CmdStan on the login node
 #    (Rorqual's compute nodes have no internet; it takes a while the first
@@ -24,7 +25,7 @@
 #
 # 3. Laptop, when all ten are done (the 1.4 GB fits stay on the cluster):
 #
-#      rsync -av 'beum@fir.alliancecan.ca:scratch/attention_fits/outputs/*_draws.rds' results/compute_canada/outputs/
+#      rsync -av 'beum@nibi.alliancecan.ca:scratch/attention_fits/outputs/*_draws.rds' results/compute_canada/outputs/
 #      Rscript code/fitting/compute_canada_attention_weights.R collect
 #
 # Time: the same fit on the data took 6.6 hours on four M2 cores with one

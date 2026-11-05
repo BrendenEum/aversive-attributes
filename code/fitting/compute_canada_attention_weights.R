@@ -20,43 +20,49 @@
 #
 #        Rscript code/fitting/compute_canada_attention_weights.R prepare
 #
-#   2. Copy the code and the inputs to the cluster (the inputs are not in
-#      git: *.rds is ignored and they carry the participants' dwell times) and
-#      submit the array job. Each task first runs
+#   2. Copy this script, the .sh and the inputs into one folder on the
+#      cluster (the inputs are not in git: *.rds is ignored and they carry the
+#      participants' dwell times). On the login node, once,
 #
-#        Rscript code/fitting/compute_canada_attention_weights.R setup
+#        Rscript compute_canada_attention_weights.R setup
 #
-#      which installs brms, posterior, dplyr, cmdstanr and CmdStan into the
-#      user's library if they are missing (a no-op afterwards), then
+#      installs brms, posterior, dplyr, cmdstanr and CmdStan into the user
+#      library if they are missing (compute nodes have no internet). Then the
+#      array job runs, per task,
 #
-#        Rscript code/fitting/compute_canada_attention_weights.R fit <1-10>
+#        Rscript compute_canada_attention_weights.R fit <1-10>
 #
-#      which leaves the full brmsfit in results/compute_canada/outputs/
-#      (about 1.4 GB, stays on the cluster) and a compact file next to it,
+#      which leaves the full brmsfit in outputs/ (about 1.4 GB, stays on the
+#      cluster) and a compact file next to it,
 #      attention_weights_utility_sim_<variant>_<range>_draws.rds: the
 #      population-level draws, their summaries, and the sampler diagnostics.
 #
-#   3. Copy the compact files back and check them; they are moved into
-#      notebooks/brm_fits/ where bayesian_model.Rmd reads them:
+#   3. Copy the compact files back into results/compute_canada/outputs/ and
+#      check them; they are moved into notebooks/brm_fits/, where
+#      bayesian_model.Rmd reads them:
 #
 #        Rscript code/fitting/compute_canada_attention_weights.R collect
 #
 # Other modes: `list` prints the job table (the array index of every
-# variant x range); `fit <i> --smoke` is a two-minute local test of the fit
-# mode (eight subjects, one short chain) that writes under
-# results/compute_canada/smoke/ and touches nothing else.
+# variant x range); `fit <i> --smoke` is a two-minute test of the fit mode
+# (eight subjects, one short chain) that writes under smoke/ and touches
+# nothing else.
 
 args <- commandArgs(trailingOnly = TRUE)
 mode <- if (length(args) == 0) "list" else args[1]
 
-# Project root: the script's own location (code/fitting/), so that nothing
-# beyond base R is needed to find the files on the cluster.
+# Two layouts, told apart by the script's own location. In the project
+# (code/fitting/) the inputs and outputs live under results/compute_canada/.
+# On the cluster the script sits in one flat folder next to the input files,
+# and writes outputs/ and smoke/ inside that folder.
 script_path <- sub("^--file=", "", grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE))
-root <- if (length(script_path) == 1) normalizePath(file.path(dirname(script_path), "..", "..")) else getwd()
+script_dir  <- if (length(script_path) == 1) normalizePath(dirname(script_path)) else getwd()
+in_project  <- file.exists(file.path(script_dir, "..", "..", "notebooks", "bayesian_model.Rmd"))
+root        <- if (in_project) normalizePath(file.path(script_dir, "..", "..")) else script_dir
 
-in_dir    <- file.path(root, "results", "compute_canada", "inputs")
-out_dir   <- file.path(root, "results", "compute_canada", "outputs")
-smoke_dir <- file.path(root, "results", "compute_canada", "smoke")
+in_dir    <- if (in_project) file.path(root, "results", "compute_canada", "inputs")  else root
+out_dir   <- if (in_project) file.path(root, "results", "compute_canada", "outputs") else file.path(root, "outputs")
+smoke_dir <- if (in_project) file.path(root, "results", "compute_canada", "smoke")   else file.path(root, "smoke")
 fits_dir  <- file.path(root, "notebooks", "brm_fits")
 
 # The jobs, in the order they matter for the paper: the main model first

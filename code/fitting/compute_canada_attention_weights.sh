@@ -1,33 +1,31 @@
 #!/bin/bash
-# SLURM array job for Fir (fir.alliancecan.ca): the ten brms attention-weight
-# fits on the Bayesian model variants' simulated choices, one variant x range
-# per task (see compute_canada_attention_weights.R). Each task takes one
-# chiplet of a Fir node (8 cores: four chains, two threads each) and installs
-# the R packages on its first run (Fir's compute nodes have internet; a lock
-# makes one task install while the others wait), so there is nothing to set
-# up by hand.
+# SLURM array job for Rorqual (rorqual.alliancecan.ca): the ten brms
+# attention-weight fits on the Bayesian model variants' simulated choices, one
+# variant x range per task (see compute_canada_attention_weights.R). Each task
+# takes one chiplet of a Rorqual node (8 cores: four chains, two threads each).
+# Everything lives in one folder on the cluster, ~/scratch/attention_fits.
 #
-# 1. Laptop, from the project root (the inputs are not in git; -R keeps the
-#    paths the R script relies on):
+# 1. Laptop, from the project root:
 #
-#      rsync -avR code/fitting/compute_canada_attention_weights.R code/fitting/compute_canada_attention_weights.sh results/compute_canada/inputs/ beum@fir.alliancecan.ca:scratch/aversive-attributes/
+#      rsync -av code/fitting/compute_canada_attention_weights.R code/fitting/compute_canada_attention_weights.sh results/compute_canada/inputs/*.rds beum@rorqual.alliancecan.ca:scratch/attention_fits/
 #
-# 2. Fir:
+# 2. Rorqual. The setup installs the R packages and CmdStan on the login node
+#    (the compute nodes have no internet; it takes a while the first time and
+#    is instant after), then the array is submitted:
 #
-#      cd ~/scratch/aversive-attributes && sbatch code/fitting/compute_canada_attention_weights.sh
+#      cd ~/scratch/attention_fits && module load StdEnv/2023 r/4.4.0 && Rscript compute_canada_attention_weights.R setup && sbatch compute_canada_attention_weights.sh
 #
-#    squeue -u $USER shows the tasks; each writes
-#    results/compute_canada/log_<job>_<task>.txt, ending in "Done in ... h"
-#    and "Exit 0", and emails when it ends.
+#    squeue -u $USER shows the tasks; each writes log_<job>_<task>.txt here,
+#    ending in "Done in ... h" and "Exit 0", and emails when it ends.
 #
-# 3. Laptop, when all ten are done (the 1.4 GB fits stay on Fir):
+# 3. Laptop, when all ten are done (the 1.4 GB fits stay on the cluster):
 #
-#      rsync -av 'beum@fir.alliancecan.ca:scratch/aversive-attributes/results/compute_canada/outputs/*_draws.rds' results/compute_canada/outputs/
+#      rsync -av 'beum@rorqual.alliancecan.ca:scratch/attention_fits/outputs/*_draws.rds' results/compute_canada/outputs/
 #      Rscript code/fitting/compute_canada_attention_weights.R collect
 #
 # Time: the same fit on the data took 6.6 hours on four M2 cores with one
-# thread per chain; the first task also spends up to an hour installing. The
-# 24-hour limit is a safety margin (a task that hits it loses its fit).
+# thread per chain. The 24-hour limit is a safety margin (a task that hits
+# it loses its fit).
 
 #SBATCH --account=def-webbr
 #SBATCH --job-name=attn_sim
@@ -35,19 +33,19 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --time=1-00:00:00 # DD-HH:MM:SS
-#SBATCH --output=/home/beum/scratch/aversive-attributes/results/compute_canada/log_%A_%a.txt
+#SBATCH --output=/home/beum/scratch/attention_fits/log_%A_%a.txt
 #SBATCH --mail-user=b.eum@rotman.utoronto.ca
 #SBATCH --mail-type=END,FAIL
 
-# Go to project folder
-cd /home/beum/scratch/aversive-attributes || exit 1
+# Go to the folder with the scripts and the inputs
+cd /home/beum/scratch/attention_fits || exit 1
 
 # Load modules
 module load StdEnv/2023
 module load r/4.4.0 2>/dev/null || module load r
-export TMPDIR="$SLURM_TMPDIR"          # CmdStan's per-chain CSV output goes to the node's NVMe
+export TMPDIR="$SLURM_TMPDIR"          # CmdStan's per-chain CSV output goes to the node's local SSD
 
 echo "Task $SLURM_ARRAY_TASK_ID on $(hostname), $(date): $(R --version | head -1)"
-flock "$HOME/.compute_canada_setup.lock" Rscript code/fitting/compute_canada_attention_weights.R setup || exit 1
-Rscript code/fitting/compute_canada_attention_weights.R fit "$SLURM_ARRAY_TASK_ID" ${SMOKE:+--smoke}
+Rscript compute_canada_attention_weights.R setup || exit 1     # only checks that the login-node setup is visible here
+Rscript compute_canada_attention_weights.R fit "$SLURM_ARRAY_TASK_ID" ${SMOKE:+--smoke}
 echo "Exit $? at $(date)"

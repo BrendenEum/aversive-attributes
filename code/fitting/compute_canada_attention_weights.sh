@@ -16,10 +16,9 @@
 #
 #      cd ~/scratch/aversive-attributes && sbatch code/fitting/compute_canada_attention_weights.sh
 #
-#    If sbatch complains about the account, add --account=def-NAME, where
-#    def-NAME is the folder in ~/project. squeue -u $USER shows the tasks;
-#    each writes results/compute_canada/log_<job>_<task>.txt, ending in
-#    "Done in ... h" and "Exit 0".
+#    squeue -u $USER shows the tasks; each writes
+#    results/compute_canada/log_<job>_<task>.txt, ending in "Done in ... h"
+#    and "Exit 0", and emails when it ends.
 #
 # 3. Laptop, when all ten are done (the 1.4 GB fits stay on Fir):
 #
@@ -30,18 +29,24 @@
 # thread per chain; the first task also spends up to an hour installing. The
 # 24-hour limit is a safety margin (a task that hits it loses its fit).
 
+#SBATCH --account=def-webbr
 #SBATCH --job-name=attn_sim
 #SBATCH --array=1-10
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
-#SBATCH --time=1-00:00
-#SBATCH --output=results/compute_canada/log_%A_%a.txt
+#SBATCH --time=1-00:00:00 # DD-HH:MM:SS
+#SBATCH --output=/home/beum/scratch/aversive-attributes/results/compute_canada/log_%A_%a.txt
+#SBATCH --mail-user=b.eum@rotman.utoronto.ca
+#SBATCH --mail-type=END,FAIL
 
+# Go to project folder
+cd /home/beum/scratch/aversive-attributes || exit 1
+
+# Load modules
 module load StdEnv/2023
 module load r/4.4.0 2>/dev/null || module load r
 export TMPDIR="$SLURM_TMPDIR"          # CmdStan's per-chain CSV output goes to the node's NVMe
 
-cd "$SLURM_SUBMIT_DIR" || exit 1
 echo "Task $SLURM_ARRAY_TASK_ID on $(hostname), $(date): $(R --version | head -1)"
 flock "$HOME/.compute_canada_setup.lock" Rscript code/fitting/compute_canada_attention_weights.R setup || exit 1
 Rscript code/fitting/compute_canada_attention_weights.R fit "$SLURM_ARRAY_TASK_ID" ${SMOKE:+--smoke}

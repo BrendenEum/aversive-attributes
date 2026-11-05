@@ -106,6 +106,11 @@ if (mode == "setup") {
   .libPaths(c(lib, .libPaths()))
   cores <- max(1L, as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", unset = "2")))
   Sys.setenv(MAKEFLAGS = paste0("-j", cores))
+  # An interrupted install leaves 00LOCK-<package> folders that block the next
+  # one; an interrupted CmdStan build leaves a folder without the example
+  # binary that install_cmdstan() compiles last. Clear both before checking.
+  locks <- list.files(lib, pattern = "^00LOCK", full.names = TRUE, include.dirs = TRUE)
+  if (length(locks)) { cat("Removing stale install locks:", basename(locks), "\n"); unlink(locks, recursive = TRUE) }
   need    <- c("brms", "posterior", "dplyr", "cmdstanr")
   missing <- need[!vapply(need, requireNamespace, logical(1), quietly = TRUE)]
   if (length(missing)) {
@@ -114,8 +119,15 @@ if (mode == "setup") {
     still <- missing[!vapply(missing, requireNamespace, logical(1), quietly = TRUE)]
     if (length(still)) stop("Failed to install: ", paste(still, collapse = ", "))
   }
-  have_cmdstan <- tryCatch({ cmdstanr::cmdstan_path(); TRUE }, error = function(e) FALSE)
-  if (!have_cmdstan) cmdstanr::install_cmdstan(cores = cores)
+  cmdstan_complete <- tryCatch({
+    d <- cmdstanr::cmdstan_path()
+    file.exists(file.path(d, "bin", "stanc")) && length(list.files(file.path(d, "examples", "bernoulli"), pattern = "^bernoulli$|^bernoulli\\.exe$")) > 0
+  }, error = function(e) FALSE)
+  if (!cmdstan_complete) {
+    partial <- tryCatch(cmdstanr::cmdstan_path(), error = function(e) NULL)
+    if (!is.null(partial)) { cat("Removing incomplete CmdStan build:", partial, "\n"); unlink(partial, recursive = TRUE) }
+    cmdstanr::install_cmdstan(cores = cores)
+  }
   cat(sprintf("Setup ok: R %s, brms %s, CmdStan %s, library %s\n", getRversion(),
               packageVersion("brms"), cmdstanr::cmdstan_version(), lib))
   quit(save = "no")

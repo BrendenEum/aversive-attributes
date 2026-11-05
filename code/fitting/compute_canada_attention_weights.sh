@@ -25,15 +25,15 @@
 #      Rscript code/fitting/compute_canada_attention_weights.R collect
 #
 # Time: the same fit on the data took 6.6 hours on four M2 cores with one
-# thread per chain. The 24-hour limit is a safety margin (a task that hits
-# it loses its fit).
+# thread per chain. The 2.5-day limit is a wide safety margin (a task that
+# hits it loses its fit); jobs up to 3 days get the same scheduling.
 
 #SBATCH --account=def-webbr
 #SBATCH --job-name=attn_sim
 #SBATCH --array=1-10
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
-#SBATCH --time=1-00:00:00 # DD-HH:MM:SS
+#SBATCH --time=2-12:00:00 # DD-HH:MM:SS; expected 5-10 h per task, this is a wide margin
 #SBATCH --output=/home/beum/links/scratch/attention_fits/log_%A_%a.txt
 #SBATCH --mail-user=b.eum@rotman.utoronto.ca
 #SBATCH --mail-type=END,FAIL

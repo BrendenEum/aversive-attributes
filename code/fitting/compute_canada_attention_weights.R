@@ -11,7 +11,7 @@
 # column of tables/bayesian_model_fits.tex on the same estimator as the data
 # side, replacing the plain logistic regressions in bayesian_model.Rmd.
 #
-# Workflow (details in compute_canada_attention_weights.sh):
+# Workflow (the exact commands are in compute_canada_attention_weights.sh):
 #
 #   1. Locally, from the project root. Simulates one choice per trial from
 #      each variant's held-out (12-fold) probabilities, seed 1, and writes the
@@ -20,10 +20,14 @@
 #
 #        Rscript code/fitting/compute_canada_attention_weights.R prepare
 #
-#   2. Copy the inputs to the cluster (they are not in git: *.rds is ignored
-#      and they carry the participants' dwell times), pull the code, submit
-#      the array job (compute_canada_attention_weights.sh). On the cluster
-#      each task runs
+#   2. Copy the code and the inputs to the cluster (the inputs are not in
+#      git: *.rds is ignored and they carry the participants' dwell times) and
+#      submit the array job. Each task first runs
+#
+#        Rscript code/fitting/compute_canada_attention_weights.R setup
+#
+#      which installs brms, posterior, dplyr, cmdstanr and CmdStan into the
+#      user's library if they are missing (a no-op afterwards), then
 #
 #        Rscript code/fitting/compute_canada_attention_weights.R fit <1-10>
 #
@@ -83,6 +87,31 @@ SETTINGS <- list(chains = 4, iter = 4000, seed = 1234, adapt_delta = 0.95, max_t
 if (mode == "list") {
   cat("Array index, variant, range:\n")
   print(cbind(index = seq_len(nrow(JOBS)), JOBS), row.names = FALSE)
+  quit(save = "no")
+}
+
+# ---------------------------------------------------------------------------
+# setup (cluster): the R packages and CmdStan, into the user library, once.
+# ---------------------------------------------------------------------------
+if (mode == "setup") {
+  lib <- path.expand(Sys.getenv("R_LIBS_USER"))        # R's default personal library for this R version
+  if (!nzchar(lib)) stop("R_LIBS_USER is not set.")
+  dir.create(lib, recursive = TRUE, showWarnings = FALSE)
+  .libPaths(c(lib, .libPaths()))
+  cores <- max(1L, as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", unset = "2")))
+  Sys.setenv(MAKEFLAGS = paste0("-j", cores))
+  need    <- c("brms", "posterior", "dplyr", "cmdstanr")
+  missing <- need[!vapply(need, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing)) {
+    cat("Installing", paste(missing, collapse = ", "), "into", lib, "\n")
+    install.packages(missing, lib = lib, repos = c("https://stan-dev.r-universe.dev", "https://cloud.r-project.org"))
+    still <- missing[!vapply(missing, requireNamespace, logical(1), quietly = TRUE)]
+    if (length(still)) stop("Failed to install: ", paste(still, collapse = ", "))
+  }
+  have_cmdstan <- tryCatch({ cmdstanr::cmdstan_path(); TRUE }, error = function(e) FALSE)
+  if (!have_cmdstan) cmdstanr::install_cmdstan(cores = cores)
+  cat(sprintf("Setup ok: R %s, brms %s, CmdStan %s, library %s\n", getRversion(),
+              packageVersion("brms"), cmdstanr::cmdstan_version(), lib))
   quit(save = "no")
 }
 
@@ -235,4 +264,4 @@ if (mode == "collect") {
   quit(save = "no")
 }
 
-stop("Unknown mode '", mode, "'. Use list, prepare, fit <i> [--smoke], or collect.")
+stop("Unknown mode '", mode, "'. Use list, prepare, setup, fit <i> [--smoke], or collect.")

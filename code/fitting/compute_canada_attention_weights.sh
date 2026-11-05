@@ -1,27 +1,30 @@
 #!/bin/bash
-# SLURM array job for Rorqual (rorqual.alliancecan.ca): the ten brms
+# SLURM array job for the Alliance clusters (Fir or Rorqual): the ten brms
 # attention-weight fits on the Bayesian model variants' simulated choices, one
 # variant x range per task (see compute_canada_attention_weights.R). Each task
-# takes one chiplet of a Rorqual node (8 cores: four chains, two threads each).
-# Everything lives in one folder on the cluster, ~/links/scratch/attention_fits
-# (Rorqual reaches scratch through the ~/links symlinks).
+# takes one chiplet of a node (8 cores: four chains, two threads each).
+# Everything lives in one folder on the cluster, attention_fits in scratch:
 #
-# 1. Laptop, from the project root:
+#   Fir:      beum@fir.alliancecan.ca      ~/scratch/attention_fits
+#   Rorqual:  beum@rorqual.alliancecan.ca  ~/links/scratch/attention_fits
 #
-#      rsync -av code/fitting/compute_canada_attention_weights.R code/fitting/compute_canada_attention_weights.sh results/compute_canada/inputs/*.rds beum@rorqual.alliancecan.ca:links/scratch/attention_fits/
+# 1. Laptop, from the project root (Fir shown; for Rorqual replace the host
+#    and put links/ in front of scratch/):
 #
-# 2. Rorqual. The setup installs the R packages and CmdStan on the login node
-#    (the compute nodes have no internet; it takes a while the first time and
-#    is instant after), then the array is submitted:
+#      rsync -av code/fitting/compute_canada_attention_weights.R code/fitting/compute_canada_attention_weights.sh results/compute_canada/inputs/*.rds beum@fir.alliancecan.ca:scratch/attention_fits/
 #
-#      cd ~/links/scratch/attention_fits && module load StdEnv/2023 r/4.4.0 && Rscript compute_canada_attention_weights.R setup && sbatch compute_canada_attention_weights.sh
+# 2. Cluster. The setup installs the R packages and CmdStan on the login node
+#    (Rorqual's compute nodes have no internet; it takes a while the first
+#    time and is instant after), then the array is submitted from the folder:
 #
-#    squeue -u $USER shows the tasks; each writes log_<job>_<task>.txt here,
-#    ending in "Done in ... h" and "Exit 0", and emails when it ends.
+#      cd ~/scratch/attention_fits && module load StdEnv/2023 r/4.4.0 && Rscript compute_canada_attention_weights.R setup && sbatch compute_canada_attention_weights.sh
+#
+#    squeue -u $USER shows the tasks; each writes log_<job>_<task>.txt in the
+#    folder, ending in "Done in ... h" and "Exit 0", and emails when it ends.
 #
 # 3. Laptop, when all ten are done (the 1.4 GB fits stay on the cluster):
 #
-#      rsync -av 'beum@rorqual.alliancecan.ca:links/scratch/attention_fits/outputs/*_draws.rds' results/compute_canada/outputs/
+#      rsync -av 'beum@fir.alliancecan.ca:scratch/attention_fits/outputs/*_draws.rds' results/compute_canada/outputs/
 #      Rscript code/fitting/compute_canada_attention_weights.R collect
 #
 # Time: the same fit on the data took 6.6 hours on four M2 cores with one
@@ -34,12 +37,12 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --time=2-12:00:00 # DD-HH:MM:SS; expected 5-10 h per task, this is a wide margin
-#SBATCH --output=/home/beum/links/scratch/attention_fits/log_%A_%a.txt
+#SBATCH --output=log_%A_%a.txt      # in the folder sbatch is run from
 #SBATCH --mail-user=b.eum@rotman.utoronto.ca
 #SBATCH --mail-type=END,FAIL
 
-# Go to the folder with the scripts and the inputs
-cd /home/beum/links/scratch/attention_fits || exit 1
+# The folder with the scripts and the inputs: where sbatch was run
+cd "$SLURM_SUBMIT_DIR" || exit 1
 
 # Load modules
 module load StdEnv/2023

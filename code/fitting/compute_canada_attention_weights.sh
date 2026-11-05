@@ -1,8 +1,8 @@
 #!/bin/bash
-# SLURM array job for the Alliance clusters (Nibi, Fir or Rorqual): the ten brms
+# SLURM array job for the Alliance clusters (Nibi, Fir or Rorqual): the 100 brms
 # attention-weight fits on the Bayesian model variants' simulated choices, one
-# variant x range per task (see compute_canada_attention_weights.R). Each task
-# takes one chiplet of a node (8 cores: four chains, two threads each).
+# variant x range x replicate per task (see compute_canada_attention_weights.R).
+# Each task takes 8 cores of a node (four chains, two threads each).
 # Everything lives in one folder on the cluster, attention_fits in scratch:
 #
 #   Nibi:     beum@nibi.alliancecan.ca     ~/scratch/attention_fits
@@ -23,21 +23,21 @@
 #    squeue -u $USER shows the tasks; each writes log_<job>_<task>.txt in the
 #    folder, ending in "Done in ... h" and "Exit 0", and emails when it ends.
 #
-# 3. Laptop, when all ten are done (the 1.4 GB fits stay on the cluster):
+# 3. Laptop, when all 100 are done (the 1.4 GB fits stay on the cluster):
 #
-#      rsync -av 'beum@nibi.alliancecan.ca:scratch/attention_fits/outputs/*_draws.rds' results/compute_canada/outputs/
+#      rsync -av 'beum@nibi.alliancecan.ca:scratch/attention_fits/outputs/*_rep*_draws.rds' results/compute_canada/outputs/
 #      Rscript code/fitting/compute_canada_attention_weights.R collect
 #
-# Time: the same fit on the data took 6.6 hours on four M2 cores with one
-# thread per chain. The 2.5-day limit is a wide safety margin (a task that
-# hits it loses its fit); jobs up to 3 days get the same scheduling.
+# Time: the first ten tasks (replicate 1) took 1.5 to 3.0 hours each on Nibi
+# with 8 cores. The 6-hour limit is a 2x margin on the slowest (a task that
+# hits it loses its fit) and keeps the tasks in a short-job scheduling tier.
 
 #SBATCH --account=def-webbr
 #SBATCH --job-name=attn_sim
-#SBATCH --array=1-10
+#SBATCH --array=1-100
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
-#SBATCH --time=2-12:00:00 # DD-HH:MM:SS; expected 5-10 h per task, this is a wide margin
+#SBATCH --time=0-06:00:00 # DD-HH:MM:SS; replicate 1 took 1.5-3.0 h per task
 #SBATCH --output=log_%A_%a.txt      # in the folder sbatch is run from
 #SBATCH --mail-user=b.eum@rotman.utoronto.ca
 #SBATCH --mail-type=END,FAIL

@@ -3,20 +3,24 @@
 # Main_Analysis.Rmd) to the choices simulated from each Bayesian model
 # variant, on a Compute Canada (Digital Research Alliance) cluster.
 #
-# Ten fits: five variants (per-condition prior with and without loss
-# aversion, per-type prior, zero prior, flat prior) x two range conditions.
-# Each is one SLURM array task (four chains, one core each, plus within-chain
-# threading over the task's remaining cores; written for Fir). The fits
-# give the model side of the attention-weight overlays and of the OOS-MAE
-# column of tables/bayesian_model_fits.tex on the same estimator as the data
-# side, replacing the plain logistic regressions in bayesian_model.Rmd.
+# One hundred fits: five variants (per-condition prior with and without loss
+# aversion, per-type prior, zero prior, flat prior) x two range conditions x
+# ten replicates of the simulated choices. A replicate is one simulated
+# choice per trial, drawn from the variant's held-out probabilities; the
+# replicates are fit as separate datasets (each the size of the data, so the
+# hierarchical model sees the data's design) and the notebooks pool their
+# posteriors. Each fit is one SLURM array task (four chains, one core each,
+# plus within-chain threading over the task's remaining cores). The fits give
+# the model side of the attention-weight overlays and of the OOS-MAE column
+# of tables/bayesian_model_fits.tex on the same estimator as the data side.
 #
 # Workflow (the exact commands are in compute_canada_attention_weights.sh):
 #
-#   1. Locally, from the project root. Simulates one choice per trial from
-#      each variant's held-out (12-fold) probabilities, seed 1, and writes the
-#      regression's design matrix per variant and range to
-#      results/compute_canada/inputs/sim_<variant>_<range>.rds:
+#   1. Locally, from the project root. Draws the ten replicates of simulated
+#      choices from each variant's held-out (12-fold) probabilities (seed 1;
+#      replicate k is the k-th of the notebook's ten) and writes the
+#      regression's design matrix per variant, range and replicate to
+#      results/compute_canada/inputs/sim_<variant>_<range>_rep<k>.rds:
 #
 #        Rscript code/fitting/compute_canada_attention_weights.R prepare
 #
@@ -30,11 +34,11 @@
 #      library if they are missing (compute nodes have no internet). Then the
 #      array job runs, per task,
 #
-#        Rscript compute_canada_attention_weights.R fit <1-10>
+#        Rscript compute_canada_attention_weights.R fit <1-100>
 #
 #      which leaves the full brmsfit in outputs/ (about 1.4 GB, stays on the
 #      cluster) and a compact file next to it,
-#      attention_weights_utility_sim_<variant>_<range>_draws.rds: the
+#      attention_weights_utility_sim_<variant>_<range>_rep<k>_draws.rds: the
 #      population-level draws, their summaries, and the sampler diagnostics.
 #
 #   3. Copy the compact files back into results/compute_canada/outputs/ and
@@ -44,7 +48,7 @@
 #        Rscript code/fitting/compute_canada_attention_weights.R collect
 #
 # Other modes: `list` prints the job table (the array index of every
-# variant x range); `fit <i> --smoke` is a two-minute test of the fit mode
+# variant x range x replicate); `fit <i> --smoke` is a two-minute test of the fit mode
 # (eight subjects, one short chain) that writes under smoke/ and touches
 # nothing else.
 
@@ -65,12 +69,14 @@ out_dir   <- if (in_project) file.path(root, "results", "compute_canada", "outpu
 smoke_dir <- if (in_project) file.path(root, "results", "compute_canada", "smoke")   else file.path(root, "smoke")
 fits_dir  <- file.path(root, "notebooks", "brm_fits")
 
-# The jobs, in the order they matter for the paper: the main model first
-# (both ranges), then the four supplementary variants. The SLURM array index
-# is the row number.
+# The jobs: replicate 1 of every variant x range first (the main model's two
+# ranges, then the four supplementary variants), then replicate 2, and so on.
+# The SLURM array index is the row number.
+REPS <- 10
 JOBS <- data.frame(
-  variant = rep(c("cond_lam", "cond_lam1", "type_lam", "zero", "flat"), each = 2),
-  range   = rep(c("Narrow", "Wide"), times = 5),
+  rep     = rep(seq_len(REPS), each = 10),
+  variant = rep(rep(c("cond_lam", "cond_lam1", "type_lam", "zero", "flat"), each = 2), times = REPS),
+  range   = rep(c("Narrow", "Wide"), times = 5 * REPS),
   stringsAsFactors = FALSE
 )
 JOBS$label <- c(cond_lam  = "Per-condition prior",
@@ -78,9 +84,9 @@ JOBS$label <- c(cond_lam  = "Per-condition prior",
                 type_lam  = "Per-type prior",
                 zero      = "Zero prior",
                 flat      = "Flat prior")[JOBS$variant]
-job_stem   <- function(v, rng) paste0(v, "_", tolower(rng))
-input_file <- function(v, rng) file.path(in_dir, paste0("sim_", job_stem(v, rng), ".rds"))
-draws_name <- function(v, rng) paste0("attention_weights_utility_sim_", job_stem(v, rng), "_draws.rds")
+job_stem   <- function(v, rng, k) paste0(v, "_", tolower(rng), "_rep", k)
+input_file <- function(v, rng, k) file.path(in_dir, paste0("sim_", job_stem(v, rng, k), ".rds"))
+draws_name <- function(v, rng, k) paste0("attention_weights_utility_sim_", job_stem(v, rng, k), "_draws.rds")
 
 # Sampler settings: the same as the data fits (Main_Analysis.Rmd, chunk
 # flex-fit-by-range) so that both sides of the overlay are the same estimator.
@@ -91,7 +97,7 @@ SETTINGS <- list(chains = 4, iter = 4000, seed = 1234, adapt_delta = 0.95, max_t
 # list
 # ---------------------------------------------------------------------------
 if (mode == "list") {
-  cat("Array index, variant, range:\n")
+  cat("Array index, replicate, variant, range:\n")
   print(cbind(index = seq_len(nrow(JOBS)), JOBS), row.names = FALSE)
   quit(save = "no")
 }
@@ -134,8 +140,8 @@ if (mode == "setup") {
 }
 
 # ---------------------------------------------------------------------------
-# prepare (local): one simulated choice per trial from each variant's held-out
-# probabilities, through the notebook's own design builder.
+# prepare (local): ten replicates of one simulated choice per trial from each
+# variant's held-out probabilities, through the notebook's own design builder.
 # ---------------------------------------------------------------------------
 if (mode == "prepare") {
   rmd    <- file.path(root, "notebooks", "bayesian_model.Rmd")
@@ -157,24 +163,27 @@ if (mode == "prepare") {
   manifest <- data.frame()
   for (v in unique(JOBS$variant)) {
     if (is.null(runs[[v]])) stop("No cached fit for variant ", v, " in results/cache/bayesian_model/.")
-    # The same draw as the first replicate of the notebook's ten (seed 1).
-    tr   <- runs[[v]]$loo$pred %>% transmute(Subject, Trial, WN, Study, p_left = p_left_heldout)
-    sims <- simulate_choices_from_prob(tr, reps = 1, seed = 1) %>%
-      transmute(Subject, Trial, WN, Study, TrialKey = Trial, ChooseL = ChooseL_sim)
-    bl_sim <- boxlong %>% select(-ChooseL) %>%
-      inner_join(sims %>% select(Subject, Trial, TrialKey, ChooseL), by = c("Subject", "Trial"))
-    for (rng in c("Narrow", "Wide")) {
-      dat <- build_utility_dat(rng, bl_sim, sims) %>% rename(Trial = TrialKey)
-      stopifnot(!anyNA(dat), all(c("Subject", "Trial", "ChooseL", "S2") %in% names(dat)))
-      saveRDS(dat, input_file(v, rng))
-      manifest <- rbind(manifest, data.frame(
-        variant = v, range = rng, file = basename(input_file(v, rng)), n_trials = nrow(dat),
-        n_subjects = n_distinct(dat$Subject), mean_choose_left = round(mean(dat$ChooseL), 4),
-        n_utility_terms = sum(grepl("^U_", names(dat))), n_dwell_terms = sum(grepl("^[PNB]_(neg|pos)[0-9]+$", names(dat))),
-        sim_seed = 1, prepared = format(Sys.time())))
-      cat(sprintf("%-10s %-6s %6d trials, %3d subjects, %2d utilities, %2d cells -> %s\n",
-                  v, rng, nrow(dat), n_distinct(dat$Subject), sum(grepl("^U_", names(dat))),
-                  sum(grepl("^[PNB]_(neg|pos)[0-9]+$", names(dat))), basename(input_file(v, rng))))
+    # The notebook's ten replicates (seed 1): replicate k is the k-th draw.
+    tr       <- runs[[v]]$loo$pred %>% transmute(Subject, Trial, WN, Study, p_left = p_left_heldout)
+    sims_all <- simulate_choices_from_prob(tr, reps = REPS, seed = 1)
+    for (k in seq_len(REPS)) {
+      sims <- sims_all %>% filter(rep == k) %>%
+        transmute(Subject, Trial, WN, Study, TrialKey = Trial, ChooseL = ChooseL_sim)
+      bl_sim <- boxlong %>% select(-ChooseL) %>%
+        inner_join(sims %>% select(Subject, Trial, TrialKey, ChooseL), by = c("Subject", "Trial"))
+      for (rng in c("Narrow", "Wide")) {
+        dat <- build_utility_dat(rng, bl_sim, sims) %>% rename(Trial = TrialKey)
+        stopifnot(!anyNA(dat), all(c("Subject", "Trial", "ChooseL", "S2") %in% names(dat)))
+        saveRDS(dat, input_file(v, rng, k))
+        manifest <- rbind(manifest, data.frame(
+          variant = v, range = rng, rep = k, file = basename(input_file(v, rng, k)), n_trials = nrow(dat),
+          n_subjects = n_distinct(dat$Subject), mean_choose_left = round(mean(dat$ChooseL), 4),
+          n_utility_terms = sum(grepl("^U_", names(dat))), n_dwell_terms = sum(grepl("^[PNB]_(neg|pos)[0-9]+$", names(dat))),
+          sim_seed = 1, prepared = format(Sys.time())))
+        cat(sprintf("%-10s %-6s rep %2d: %6d trials, %3d subjects, %2d utilities, %2d cells -> %s\n",
+                    v, rng, k, nrow(dat), n_distinct(dat$Subject), sum(grepl("^U_", names(dat))),
+                    sum(grepl("^[PNB]_(neg|pos)[0-9]+$", names(dat))), basename(input_file(v, rng, k))))
+      }
     }
   }
   write.csv(manifest, file.path(in_dir, "manifest.csv"), row.names = FALSE)
@@ -183,23 +192,25 @@ if (mode == "prepare") {
 }
 
 # ---------------------------------------------------------------------------
-# fit (cluster): one job = one variant x range.
+# fit (cluster): one job = one variant x range x replicate.
 # ---------------------------------------------------------------------------
 if (mode == "fit") {
-  if (length(args) < 2) stop("Usage: fit <array index 1-10 | variant range> [--smoke]")
+  if (length(args) < 2) stop("Usage: fit <array index 1-100 | variant range replicate> [--smoke]")
   smoke <- "--smoke" %in% args
   if (grepl("^[0-9]+$", args[2])) {
-    i <- as.integer(args[2]); v <- JOBS$variant[i]; rng <- JOBS$range[i]
+    i <- as.integer(args[2]); v <- JOBS$variant[i]; rng <- JOBS$range[i]; k <- JOBS$rep[i]
   } else {
-    v <- args[2]; rng <- args[3]
+    v <- args[2]; rng <- args[3]; k <- as.integer(args[4])
   }
-  if (is.na(v) || !(v %in% JOBS$variant) || !(rng %in% c("Narrow", "Wide"))) stop("Unknown job: ", paste(args[-1], collapse = " "))
+  if (is.na(v) || !(v %in% JOBS$variant) || !(rng %in% c("Narrow", "Wide")) || is.na(k) || !(k %in% seq_len(REPS))) {
+    stop("Unknown job: ", paste(args[-1], collapse = " "))
+  }
 
   suppressPackageStartupMessages({ library(brms); library(posterior); library(dplyr) })
   cores <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", unset = "4"))
   options(brms.backend = SETTINGS$backend, mc.cores = cores)
 
-  dat <- readRDS(input_file(v, rng))
+  dat <- readRDS(input_file(v, rng, k))
   util_cols  <- grep("^U_", names(dat), value = TRUE)
   dwell_cols <- grep("^[PNB]_(neg|pos)[0-9]+$", names(dat), value = TRUE)
   # build_flex_formula() of Main_Analysis.Rmd: population utility for every
@@ -223,11 +234,11 @@ if (mode == "fit") {
     chains <- 1; iter <- 300; write_dir <- smoke_dir
   }
   dir.create(write_dir, recursive = TRUE, showWarnings = FALSE)
-  fit_file   <- file.path(write_dir, paste0("fit_", job_stem(v, rng)))           # brm adds .rds
-  draws_file <- file.path(write_dir, draws_name(v, rng))
+  fit_file   <- file.path(write_dir, paste0("fit_", job_stem(v, rng, k)))        # brm adds .rds
+  draws_file <- file.path(write_dir, draws_name(v, rng, k))
 
-  cat(sprintf("Fitting %s (%s), %s: %d trials, %d subjects, %d cores, %d chains x %d iterations, %d thread(s) per chain%s\n",
-              v, JOBS$label[JOBS$variant == v][1], rng, nrow(dat), n_distinct(dat$Subject), cores, chains, iter, threads,
+  cat(sprintf("Fitting %s (%s), %s, replicate %d: %d trials, %d subjects, %d cores, %d chains x %d iterations, %d thread(s) per chain%s\n",
+              v, JOBS$label[JOBS$variant == v][1], rng, k, nrow(dat), n_distinct(dat$Subject), cores, chains, iter, threads,
               if (smoke) " [SMOKE TEST]" else ""))
   t0  <- Sys.time()
   fit <- brm(formula, data = dat, family = bernoulli(), prior = priors,
@@ -242,7 +253,7 @@ if (mode == "fit") {
   summ  <- summarise_draws(draws, "mean", "sd", ~quantile2(.x, probs = c(0.025, 0.975)), "rhat", "ess_bulk", "ess_tail")
   np    <- nuts_params(fit)
   out <- list(
-    variant = v, label = JOBS$label[JOBS$variant == v][1], range = rng, smoke = smoke,
+    variant = v, label = JOBS$label[JOBS$variant == v][1], range = rng, rep = k, smoke = smoke,
     draws = draws, summary = summ,
     n_divergent     = sum(np$Value[np$Parameter == "divergent__"]),
     n_max_treedepth = sum(np$Value[np$Parameter == "treedepth__"] >= SETTINGS$max_treedepth),
@@ -266,19 +277,28 @@ if (mode == "collect") {
   dir.create(fits_dir, recursive = TRUE, showWarnings = FALSE)
   rows <- data.frame()
   for (i in seq_len(nrow(JOBS))) {
-    v <- JOBS$variant[i]; rng <- JOBS$range[i]
-    src <- file.path(out_dir, draws_name(v, rng)); dst <- file.path(fits_dir, draws_name(v, rng))
+    v <- JOBS$variant[i]; rng <- JOBS$range[i]; k <- JOBS$rep[i]
+    src <- file.path(out_dir, draws_name(v, rng, k)); dst <- file.path(fits_dir, draws_name(v, rng, k))
     if (file.exists(src)) file.copy(src, dst, overwrite = TRUE)
-    if (!file.exists(dst)) { rows <- rbind(rows, data.frame(variant = v, range = rng, status = "missing")); next }
+    if (!file.exists(dst)) { rows <- rbind(rows, data.frame(variant = v, range = rng, rep = k, status = "missing")); next }
     x <- readRDS(dst)
     w <- x$summary[grepl("^b_[PNB]_(neg|pos)[0-9]+$", x$summary$variable), ]
     rows <- rbind(rows, data.frame(
-      variant = v, range = rng, status = if (isTRUE(x$smoke)) "SMOKE" else "ok",
+      variant = v, range = rng, rep = k, status = if (isTRUE(x$smoke)) "SMOKE" else "ok",
       hours = round(x$elapsed_hours, 2), divergent = x$n_divergent, treedepth = x$n_max_treedepth,
       max_rhat = round(max(x$summary$rhat, na.rm = TRUE), 3), min_ess_bulk = round(min(x$summary$ess_bulk, na.rm = TRUE)),
       weights_min = round(min(w$mean), 3), weights_max = round(max(w$mean), 3)))
   }
   print(rows, row.names = FALSE)
+  # One line per variant x range: how many replicates are back, and the worst diagnostics over them.
+  ok <- rows[rows$status == "ok", ]
+  if (nrow(ok)) {
+    cat("\nPer variant x range (replicates back, hours per fit, worst diagnostics):\n")
+    agg <- do.call(rbind, lapply(split(ok, list(ok$variant, ok$range), drop = TRUE), function(d) data.frame(
+      variant = d$variant[1], range = d$range[1], reps = nrow(d), hours_mean = round(mean(d$hours), 2), hours_max = round(max(d$hours), 2),
+      divergent = sum(d$divergent), treedepth = sum(d$treedepth), max_rhat = max(d$max_rhat), min_ess_bulk = min(d$min_ess_bulk))))
+    print(agg[order(match(agg$variant, unique(JOBS$variant)), agg$range), ], row.names = FALSE)
+  }
   quit(save = "no")
 }
 

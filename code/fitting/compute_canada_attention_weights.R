@@ -5,7 +5,8 @@
 #
 # Ten fits: five variants (per-condition prior with and without loss
 # aversion, per-type prior, zero prior, flat prior) x two range conditions.
-# Each is one SLURM array task of four cores (one chain per core). The fits
+# Each is one SLURM array task (four chains, one core each, plus within-chain
+# threading over the task's remaining cores; written for Fir). The fits
 # give the model side of the attention-weight overlays and of the OOS-MAE
 # column of tables/bayesian_model_fits.tex on the same estimator as the data
 # side, replacing the plain logistic regressions in bayesian_model.Rmd.
@@ -165,6 +166,9 @@ if (mode == "fit") {
   priors <- c(prior(normal(0, 2.5), class = "b"), prior(normal(0, 2), class = "Intercept"))
 
   chains <- SETTINGS$chains; iter <- SETTINGS$iter
+  # Cores beyond one per chain go to within-chain threading (reduce_sum): the
+  # same posterior, a faster fit. Four cores = four plain chains.
+  threads <- max(1L, cores %/% chains)
   write_dir <- out_dir
   if (smoke) {
     keep <- head(unique(dat$Subject), 8)
@@ -175,14 +179,14 @@ if (mode == "fit") {
   fit_file   <- file.path(write_dir, paste0("fit_", job_stem(v, rng)))           # brm adds .rds
   draws_file <- file.path(write_dir, draws_name(v, rng))
 
-  cat(sprintf("Fitting %s (%s), %s: %d trials, %d subjects, %d cores, %d chains x %d iterations%s\n",
-              v, JOBS$label[JOBS$variant == v][1], rng, nrow(dat), n_distinct(dat$Subject), cores, chains, iter,
+  cat(sprintf("Fitting %s (%s), %s: %d trials, %d subjects, %d cores, %d chains x %d iterations, %d thread(s) per chain%s\n",
+              v, JOBS$label[JOBS$variant == v][1], rng, nrow(dat), n_distinct(dat$Subject), cores, chains, iter, threads,
               if (smoke) " [SMOKE TEST]" else ""))
   t0  <- Sys.time()
   fit <- brm(formula, data = dat, family = bernoulli(), prior = priors,
              chains = chains, cores = min(chains, cores), iter = iter, seed = SETTINGS$seed,
              control = list(adapt_delta = SETTINGS$adapt_delta, max_treedepth = SETTINGS$max_treedepth),
-             file = fit_file, file_refit = "never")
+             threads = threading(threads), file = fit_file, file_refit = "never")
   elapsed <- as.numeric(difftime(Sys.time(), t0, units = "hours"))
 
   # The compact file: population-level draws (the intercepts, the utilities,
@@ -196,7 +200,7 @@ if (mode == "fit") {
     n_divergent     = sum(np$Value[np$Parameter == "divergent__"]),
     n_max_treedepth = sum(np$Value[np$Parameter == "treedepth__"] >= SETTINGS$max_treedepth),
     n_trials = nrow(dat), n_subjects = n_distinct(dat$Subject),
-    formula = deparse1(formula), settings = modifyList(SETTINGS, list(chains = chains, iter = iter)),
+    formula = deparse1(formula), settings = modifyList(SETTINGS, list(chains = chains, iter = iter, threads_per_chain = threads)),
     versions = list(R = R.version.string, brms = as.character(packageVersion("brms")),
                     cmdstan = tryCatch(as.character(cmdstanr::cmdstan_version()), error = function(e) NA)),
     elapsed_hours = elapsed, finished = Sys.time()

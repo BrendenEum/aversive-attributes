@@ -63,10 +63,11 @@ source(here::here("code/utilities/getAllUtilities.R"))
 
 ```{r options}
 # Set to FALSE for a fast, figures-only pass. The attribute-level figure still
-# gets drawn from the cached brms fits in notebooks/brm_fits/. Set to TRUE to
+# gets drawn from the cached brms fits in notebooks/brm_fits/ and the cached
+# held-out predictions of the Bayesian model. Set to TRUE to
 # fit every regression, write the LaTeX tables and the in-text statistics, and
-# sample any brms model whose cache is missing (the two pooled attention-weight
-# fits take many hours each the first time; see
+# sample any brms model whose cache is missing (the two attention-weight fits,
+# Narrow and Wide, take many hours each the first time; see
 # code/fitting/sample_pooled_attention_weights.R to run them from a terminal).
 RUN_REGRESSIONS <- FALSE
 
@@ -76,6 +77,8 @@ fig_dir  <- file.path(paths$root, paths$paper_figures)
 tab_dir  <- file.path(paths$root, paths$paper_tables)
 text_dir <- file.path(paths$root, paths$paper_text)
 fit_dir  <- file.path(paths$root, paths$notebooks, "brm_fits")
+# Caches of the Bayesian model (written by code/fitting/run_bayesian_fits.R).
+bayes_dir <- file.path(paths$root, paths$results$cache, "bayesian_model")
 for (d in c(fig_dir, tab_dir, text_dir, fit_dir)) dir.create(d, showWarnings = FALSE, recursive = TRUE)
 
 # brms sampling settings (cmdstanr backend).
@@ -155,6 +158,12 @@ legend_right <- theme(legend.position = "right")
 # use .linewidth from MyPlotOptions.
 pt_size      <- 0
 pt_linewidth <- 0.7
+
+# In a combined figure, a missing panel (e.g. a fit that was not run) leaves an
+# empty space rather than breaking the layout: get_or_spacer(panels, "Data").
+get_or_spacer <- function(plots, key) {
+  if (is.null(plots[[key]])) plot_spacer() else plots[[key]]
+}
 ```
 
 ```{r model-helpers}
@@ -217,24 +226,27 @@ term_labels <- c(
   "typeN"          = "Type N",
   "typeB"          = "Type B",
   "value10"        = "Value",
-  "SV_P"           = "Value (P)",
-  "SV_N"           = "Value (N)",
-  "SV_B"           = "Value (B)"
+  "SV_P"           = "Value Diff. (P)",
+  "SV_N"           = "Value Diff. (N)",
+  "SV_B"           = "Value Diff. (B)",
+  "S2"             = "Study 2"          # Study 2 term on the intercept (pooled attention-weight models)
 )
 
 # Label predictors with term_labels, piece by piece for interactions
 # ("Diff10:DwellDiff" -> "Value Diff. × Net Dwell"). Attention-weight cells
-# read like the figures ("N_neg50" -> "N, -50"). Anything else passes through.
+# read like the figures ("N_neg50" -> "N, -50"), and so do their utilities
+# ("U_N_neg50" -> "N, -50"). Anything else passes through.
 label_term <- function(term) {
   labels <- c()
   for (tm in term) {
     pieces <- str_split(tm, ":")[[1]]
     for (k in seq_along(pieces)) {
+      cell <- str_remove(pieces[k], "^U_")   # a utility is labeled like its cell
       if (pieces[k] %in% names(term_labels)) {
         pieces[k] <- term_labels[[pieces[k]]]
-      } else if (str_detect(pieces[k], "^[PNB]_(neg|pos)[0-9]+$")) {
-        sign <- if (str_detect(pieces[k], "_neg")) "-" else ""
-        pieces[k] <- paste0(str_sub(pieces[k], 1, 1), ", ", sign, str_extract(pieces[k], "[0-9]+$"))
+      } else if (str_detect(cell, "^[PNB]_(neg|pos)[0-9]+$")) {
+        sign <- if (str_detect(cell, "_neg")) "-" else ""
+        pieces[k] <- paste0(str_sub(cell, 1, 1), ", ", sign, str_extract(cell, "[0-9]+$"))
       }
     }
     labels <- c(labels, paste(pieces, collapse = " × "))
@@ -281,7 +293,9 @@ gof_freq <- function(fit, estimation) {
 # table can show more decimals than another.
 table_columns <- function(coefs, gof, columns, digits = 3) {
   coefs <- bind_cols(coefs, split_moderators(coefs$term))
-  fmt   <- function(x) formatC(x, format = "f", digits = digits)
+  # `+ 0` turns a rounded negative zero into a plain zero ("0.000", not "-0.000").
+  # A missing bound stays missing: a row fixed by construction has no interval.
+  fmt   <- function(x) ifelse(is.na(x), NA_character_, formatC(round(x, digits) + 0, format = "f", digits = digits))
 
   out <- list()
   for (m in names(columns)) {
@@ -292,6 +306,9 @@ table_columns <- function(coefs, gof, columns, digits = 3) {
       conf.low  = fmt(rows$conf.low),
       conf.high = fmt(rows$conf.high)
     )
+    # A `text` column in coefs prints verbatim in place of the estimate, e.g.
+    # "0 (reference)" for a utility that is fixed at zero by construction.
+    if ("text" %in% names(rows)) tidy$estimate[!is.na(rows$text)] <- rows$text[!is.na(rows$text)]
     glance <- if (m == names(columns)[1]) gof else tibble(nobs = NA_real_)
     out[[columns[[m]]]] <- structure(list(tidy = tidy, glance = glance), class = "modelsummary_list")
   }
@@ -331,11 +348,29 @@ sd_note <- function(sds, intro = "Random-effect SDs across subjects.") {
 # stacks with shape = "rbind". Intervals go on a line of their own under each
 # estimate, unless `ci_inline` is TRUE, which puts them next to the estimate
 # (halving the length of a table that has room to spare in width).
-save_tex <- function(tab, name, note = NULL, ci_inline = FALSE) {
+# `coef_order` (row labels, in order) fixes the row order when the models in a
+# table have different rows; otherwise rows follow their first appearance.
+save_tex <- function(tab, name, note = NULL, ci_inline = FALSE, coef_order = NULL) {
   file      <- file.path(tab_dir, paste0(name, ".tex"))
+  coef_map  <- if (is.null(coef_order)) NULL else setNames(coef_order, coef_order)
   is_panels <- !inherits(tab[[1]], "modelsummary_list")
   if (ci_inline) {
-    estimate  <- "{estimate} [{conf.low}, {conf.high}]"
+    # Put the interval next to the estimate here rather than through
+    # modelsummary's glue template, so that a row without an interval (a
+    # reference fixed at zero) prints its estimate alone.
+    inline <- function(m) {
+      t      <- m$tidy
+      has_ci <- !is.na(t$conf.low) & !is.na(t$conf.high)
+      t$estimate <- ifelse(has_ci, paste0(t$estimate, " [", t$conf.low, ", ", t$conf.high, "]"), t$estimate)
+      m$tidy <- t %>% select(-conf.low, -conf.high)
+      m
+    }
+    if (is_panels) {
+      for (p in seq_along(tab)) for (k in seq_along(tab[[p]])) tab[[p]][[k]] <- inline(tab[[p]][[k]])
+    } else {
+      for (k in seq_along(tab)) tab[[k]] <- inline(tab[[k]])
+    }
+    estimate  <- "{estimate}"
     statistic <- NULL
   } else {
     estimate  <- "{estimate}"
@@ -353,10 +388,10 @@ save_tex <- function(tab, name, note = NULL, ci_inline = FALSE) {
   )
   if (is_panels) {
     tex <- modelsummary(tab, shape = "rbind", estimate = estimate, statistic = statistic,
-                        gof_map = gof_map, output = "latex_tabular")
+                        gof_map = gof_map, coef_map = coef_map, output = "latex_tabular")
   } else {
     tex <- modelsummary(tab, estimate = estimate, statistic = statistic,
-                        gof_map = gof_map, output = "latex_tabular")
+                        gof_map = gof_map, coef_map = coef_map, output = "latex_tabular")
   }
   tex   <- strsplit(paste(as.character(tex), collapse = "\n"), "\n")[[1]]
   n_col <- nchar(str_match(tex[1], "\\{(l+)\\}")[, 2])
@@ -390,10 +425,10 @@ save_tex <- function(tab, name, note = NULL, ci_inline = FALSE) {
     }
   }
 
-  # The note spans the text width, in a smaller font, under the table.
+  # The note spans the text width, in script size, under the table.
   if (!is.null(note)) {
     out <- c(out, "\\par\\medskip",
-             paste0("\\begin{minipage}{\\linewidth}\\footnotesize ", note, "\\end{minipage}"))
+             paste0("\\begin{minipage}{\\linewidth}\\scriptsize ", note, "\\end{minipage}"))
   }
 
   writeLines(out, file)
@@ -444,10 +479,12 @@ gof_brms <- function(fit, estimation = "Bayesian (brms)") {
   )
 }
 
-# Order for the attention-weight tables: the intercept and value channels as
-# they come, then the cells sorted like the figures, by type (N, B, P) and then
-# by value. `pred` are predictor names such as "SV_P" or "N_neg50".
+# Order for the attention-weight tables: the intercept and other predictors
+# as they come, then the cells sorted like the figures, by type (N, B, P) and
+# then by value. `pred` are predictor names such as "SV_P", "N_neg50" or
+# "U_N_neg50" (a utility sorts like its cell).
 cell_order <- function(pred) {
+  pred    <- str_remove(pred, "^U_")
   is_cell <- str_detect(pred, "^[PNB]_(neg|pos)[0-9]+$")
   type    <- match(str_sub(pred, 1, 1), c("N", "B", "P"))
   value   <- as.numeric(str_extract(pred, "[0-9]+$")) * if_else(str_detect(pred, "_neg"), -1, 1)
@@ -476,7 +513,8 @@ save_text <- function(text, name) {
 
 # "0.013\ [0.003, 0.023]": an estimate with its 95% interval.
 fmt_ci <- function(est, lo, hi, digits = 3) {
-  sprintf("%.*f\\ [%.*f, %.*f]", digits, est, digits, lo, digits, hi)
+  z <- function(x) round(x, digits) + 0   # so a bound that rounds to 0 prints as 0.000, not -0.000
+  sprintf("%.*f\\ [%.*f, %.*f]", digits, z(est), digits, z(lo), digits, z(hi))
 }
 
 # p-values: three decimals, or scientific notation below .001 (e.g. "p = 3e-15").
@@ -729,6 +767,132 @@ fig_psych <- (p_choice / p_rt) +
 
 ggsave(file.path(fig_dir, "basic_psychometrics.pdf"), fig_psych, width = 2 * .figw, height = 2 * .figh)
 fig_psych
+```
+
+## Range Sensitivity Simulations
+
+The paper argues that the lower value sensitivity of the Wide condition is what
+models of value normalization predict (Supplementary "Range Sensitivity
+Simulations"). Here we simulate choices from four such models on two
+hypothetical studies built from our own trials, then run the same choice
+regression on each simulated data set. Every model maps a box's objective value
+$a$ to a subjective value $f(a)$ through the context of its attribute type, an
+option's subjective value is the sum of its two boxes, and choice is a logit on
+the left minus right subjective value. Each model lives in its own script under
+`code/simulation/`, with the shared pieces (trial sets, participants, choice
+rule) in `simulate_normalized_choices.R`:
+
+- **Range normalization** (`simulate_range_normalization.R`):
+  $f(a) = (a - \min) / (\max - \min)$, where min and max are the smallest and
+  largest value the type takes in the participant's range condition.
+- **Context divisive normalization** (`simulate_context_divisive_normalization.R`):
+  $f(a) = a / (\sigma_h + \omega \, \overline{|a|})$, dividing by the mean
+  magnitude of the type's values in the range condition ($\sigma_h = 5$,
+  $\omega = 1$).
+- **Trial divisive normalization** (`simulate_trial_divisive_normalization.R`):
+  $f(a_L) = a_L / (\sigma_h + \omega (|a_L| + |a_R|))$, dividing by the two
+  values the attribute takes on the current trial (same parameters).
+- **Rank normalization** (`simulate_rank_normalization.R`):
+  $f(a) = (\text{rank}(a) - 1) / 5$, the rank of the value among the six
+  values of its type in the range condition.
+
+Each hypothetical study is one range condition with 60 real trials (20 per
+block type, drawn from both studies) and 260 participants, matching Study 2.
+Participants differ only in inverse temperature (uniform from 1 to 5); there
+is no side bias, nothing about a participant depends on their condition, and
+all four models use the same participants, trials, and random draws. Because
+every participant sees the same 60 trials, a value difference that occurs on
+only one or two trials reflects the makeup of those trials, which is why the
+curves of the two divisive models are jagged.
+
+```{r range-sim-simulate}
+source(here::here("code/simulation/simulate_range_normalization.R"))
+source(here::here("code/simulation/simulate_context_divisive_normalization.R"))
+source(here::here("code/simulation/simulate_trial_divisive_normalization.R"))
+source(here::here("code/simulation/simulate_rank_normalization.R"))
+
+sim_design       <- design_values(pas)       # the six values per type and condition
+sim_trials       <- make_trial_sets(pas)     # 60 real trials per condition
+sim_participants <- draw_participants()      # 260 per condition
+
+# One simulation function per model, named as the figure will label them.
+sim_models <- list(
+  "Range Normalization"            = simulate_range_normalization,
+  "Context Divisive Normalization" = simulate_context_divisive_normalization,
+  "Trial Divisive Normalization"   = simulate_trial_divisive_normalization,
+  "Rank Normalization"             = simulate_rank_normalization
+)
+
+sim_data <- list()
+for (m in names(sim_models)) {
+  sim_data[[m]] <- sim_models[[m]](sim_trials, sim_participants, sim_design) %>% mutate(Model = m)
+}
+sim_data <- bind_rows(sim_data) %>% mutate(Model = factor(Model, levels = names(sim_models)))
+```
+
+The regression is the choice model of the Regressions section below without the
+study terms. The quantity of interest is the `Diff10:WNWide` interaction, the
+Wide minus Narrow difference in slope. Each panel is annotated with the
+condition that has the steeper slope and the p-value of that difference,
+rounded to three decimals (in scientific notation when it is below .001). These four fits take a few seconds, so they run on every pass.
+
+```{r range-sim-regressions}
+sim_stats <- data.frame()
+for (m in names(sim_models)) {
+  fit <- glmmTMB(ChooseL ~ Diff10 * WN + (1 + Diff10 | Subject),
+                 data = filter(sim_data, Model == m), family = binomial)
+  coefs <- summary(fit)$coefficients$cond
+  sim_stats <- rbind(sim_stats, data.frame(
+    Model        = m,
+    slope_narrow = coefs["Diff10", "Estimate"],
+    slope_wide   = coefs["Diff10", "Estimate"] + coefs["Diff10:WNWide", "Estimate"],
+    interaction  = coefs["Diff10:WNWide", "Estimate"],
+    se           = coefs["Diff10:WNWide", "Std. Error"],
+    p            = coefs["Diff10:WNWide", "Pr(>|z|)"]
+  ))
+}
+# Annotation in the figure: which condition is steeper, and the p-value of the
+# difference in slope (the Diff10:WNWide interaction). fmt_p (text-helpers)
+# gives three decimals, or scientific notation when p is below .001 and three
+# decimals would read 0.000 (e.g. "p = 8e-15"). All four models have a steeper
+# Narrow slope; the direction word follows the sign of the interaction so that
+# a label can never state the wrong direction.
+sim_stats$label <- NA_character_
+for (i in 1:nrow(sim_stats)) {
+  steeper <- ifelse(sim_stats$interaction[i] < 0, "Narrow steeper than Wide", "Wide steeper than Narrow")
+  sim_stats$label[i] <- paste0(steeper, " (", fmt_p(sim_stats$p[i]), ")")
+}
+sim_stats$Model <- factor(sim_stats$Model, levels = names(sim_models))
+sim_stats
+```
+
+```{r fig-range-sim, fig.width=2 * .figw, fig.height=2 * .figh}
+# 2 x 2 panels, one per model, formatted like the choice row of the basic
+# psychometrics figure. Points are means across simulated participants with
+# standard errors; the annotation in the bottom right of each panel says which
+# condition is steeper and the p-value of the difference in slope.
+pdata_sim <- sim_data %>%
+  group_by(Model, Subject, WN, Diff) %>%
+  summarise(y_subject = mean(ChooseL), .groups = "drop") %>%
+  group_by(Model, WN, Diff) %>%
+  summarise(y = mean(y_subject), se = sd(y_subject) / sqrt(n()), .groups = "drop")
+
+fig_range_sim <- ggplot(pdata_sim, aes(x = Diff, y = y, color = WN, shape = WN)) +
+  facet_wrap(~ Model, ncol = 2) +
+  geom_vline(xintercept = 0,   linetype = "dotted", color = "grey50") +
+  geom_hline(yintercept = 0.5, linetype = "dotted", color = "grey50") +
+  geom_line(linewidth = .linewidth, position = wn_dodge) +
+  geom_pointrange(aes(ymin = y - se, ymax = y + se), size = pt_size, linewidth = .linewidth,
+                  position = wn_dodge) +
+  geom_text(data = sim_stats, aes(x = Inf, y = -Inf, label = label), inherit.aes = FALSE,
+            hjust = 1.05, vjust = -0.6, size = .strip_pt * .fontscale / .pt) +
+  wn_scales +
+  labs(x = "Value Difference (L - R)", y = "Pr(Choose Left)") +
+  .myPlot + strip_style + legend_right +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.5), labels = scales::percent_format(accuracy = 1))
+
+ggsave(file.path(fig_dir, "range_sensitivity_simulations.pdf"), fig_range_sim, width = 2 * .figw, height = 2 * .figh)
+fig_range_sim
 ```
 
 ## Regressions
@@ -1276,60 +1440,95 @@ if (RUN_REGRESSIONS) {
 
 The central analysis. A **signed attention weight** is the effect of one second
 of dwell on a box on the log-odds of choosing that box's option, holding the
-value difference constant. One weight per (type x value) cell, with partial
-pooling: every subject gets their own weight per cell, and we plot the
-population mean. Positive means attention pulls choice toward the attended
-option; negative means it pushes choice away.
+values of all four boxes constant. One weight per (type x value) cell, with
+partial pooling: every subject gets their own weight per cell, and we report
+the population weight. Positive means attention pulls choice toward the
+attended option; negative means it pushes choice away.
+
+Value is held constant without assuming a linear value function: every
+(type x value) cell also gets a **utility**, the log-odds contribution of
+having that value on an option. Its regressor is the cell's signed presence
+(+1 if the cell's box is on the left, -1 on the right, 0 if not on screen).
+Each attribute type has one box on each side of a trial, so a type's six
+presence columns sum to zero on every trial and only differences between the
+utilities of a type are identified: the lowest value of each type is the
+reference (utility 0) and the other five are relative to it. A dwell weight is
+then estimated only from how dwell on a box varies across the trials on which
+that box is shown. With a linear value function instead (the model in the
+first version of this notebook, now under Extra Analyses), any gap between a
+value's true utility and the line landed on that cell's dwell weight, because
+dwell on a shown box is always positive.
 
 Narrow and Wide have partly different value sets, so there is one model per
-range condition. Each model pools both studies: Study 1 is the reference level,
-and every value channel and cell weight gets a `:Study2` interaction, so a
-Study 2 weight is the Study 1 weight plus that interaction.
+range condition. Each model pools both studies: the design (value sets,
+constraints, instructions) was identical, and fits with separate weights per
+study agree (Extra Analyses). A Study 2 term on the intercept lets the side
+bias differ between studies.
 
 These are the only Bayesian models in the notebook. With a random slope per
 subject for every one of the 18 cells, maximum likelihood (glmmTMB) did not
 converge and pushed several cell variances to zero; the weakly informative
 priors and partial pooling in brms keep the cell weights well behaved.
 
+The figure puts the data's weights (left) next to the weights that the main
+Bayesian model produces out of sample (right). The model itself is fit in
+`notebooks/bayesian_model.Rmd` and `code/fitting/`; here we only load its
+held-out choice probabilities.
+
 ## Design matrices
 
-Per trial: choice, study, the three signed value channels (`SV_P`, `SV_N`,
-`SV_B`), and signed dwell time in every (type x value) cell.
+Per trial: choice, a Study 2 indicator, the signed presence of every
+(type x value) cell except the three references (`U_*`), and the signed dwell
+time in every cell.
 
 ```{r flex-design}
-build_flex_dat <- function(range) {
-  bl <- boxlong %>% filter(WN == range)
-  ps <- pas     %>% filter(WN == range)
+# `bl` (box level) and `ps` (trial level) are the real data by default. The
+# Bayesian model section passes simulated trials instead.
+build_flex_dat <- function(range, bl = boxlong, ps = pas) {
+  bl <- bl %>% filter(WN == range)
+  ps <- ps %>% filter(WN == range)
 
   # Signed dwell per cell. One column per cell, 0 where that cell wasn't on screen.
-  flex_design <- bl %>%
+  dwell_design <- bl %>%
     group_by(Subject, Trial, cell) %>%
     summarise(sd = sum(signed_dwell), .groups = "drop") %>%
     pivot_wider(names_from = cell, values_from = sd, values_fill = 0)
 
-  # Signed value per attribute type. These three sum to Diff / 10.
-  value_design <- bl %>%
-    group_by(Subject, Trial, type) %>%
-    summarise(SV = sum(signed_value), .groups = "drop") %>%
-    pivot_wider(names_from = type, values_from = SV,
-                names_prefix = "SV_", values_fill = 0)
+  # Signed presence per cell: +1 if the cell's box is on the left, -1 if on the
+  # right, 0 if not on screen. Its coefficient is the utility of that value.
+  # A type's six columns sum to zero on every trial (one box per side), so the
+  # lowest value of each type is dropped: it is the reference with utility 0.
+  util_design <- bl %>%
+    group_by(Subject, Trial, cell) %>%
+    summarise(sp = sum(side_sign), .groups = "drop") %>%
+    pivot_wider(names_from = cell, values_from = sp, values_fill = 0, names_prefix = "U_")
+  ref_cells <- bl %>%
+    distinct(type, value, cell) %>%
+    group_by(type) %>%
+    slice_min(value, n = 1) %>%
+    pull(cell)
+  util_design <- util_design %>% select(-all_of(paste0("U_", ref_cells)))
 
+  # S2 is the Study 2 indicator for the intercept. (It is not called "Study2"
+  # because the table helpers treat a term named Study2 as an interaction.)
   ps %>%
-    transmute(Subject, Trial, ChooseL, Study = factor(Study)) %>%
-    left_join(value_design, by = c("Subject", "Trial")) %>%
-    left_join(flex_design,  by = c("Subject", "Trial"))
+    transmute(Subject, Trial, ChooseL, S2 = as.integer(Study == 2), Study = factor(Study)) %>%
+    left_join(util_design,  by = c("Subject", "Trial")) %>%
+    left_join(dwell_design, by = c("Subject", "Trial"))
 }
 
-# Population weight for every value channel and cell, each crossed with study,
-# plus subject-level random slopes on the value channels and on every cell
-# (one set per subject; each subject is in only one study).
+# Names of the utility and dwell regressors in a design.
+util_cols  <- function(dat) str_subset(names(dat), "^U_")
+dwell_cols <- function(dat) str_subset(names(dat), "^[PNB]_(neg|pos)[0-9]+$")
+
+# Population utility for every value and population weight for every cell,
+# pooled over studies, plus subject-level random slopes on every utility
+# (uncorrelated) and on every cell weight (correlated).
 build_flex_formula <- function(dat) {
-  value_cols <- c("SV_P", "SV_N", "SV_B")
-  cell_cols  <- setdiff(names(dat), c("Subject", "Trial", "ChooseL", "Study", value_cols))
   as.formula(paste(
-    "ChooseL ~ (", paste(c(value_cols, cell_cols), collapse = " + "), ") * Study",
-    "+ (0 + SV_P + SV_N + SV_B | Subject)",
-    "+ (0 +", paste(cell_cols, collapse = " + "), "| Subject)"
+    "ChooseL ~ 1 + S2 +", paste(util_cols(dat), collapse = " + "), "+", paste(dwell_cols(dat), collapse = " + "),
+    "+ (0 +", paste(util_cols(dat),  collapse = " + "), "|| Subject)",
+    "+ (0 +", paste(dwell_cols(dat), collapse = " + "), "| Subject)"
   ))
 }
 ```
@@ -1337,18 +1536,21 @@ build_flex_formula <- function(dat) {
 ## Fits
 
 Sampling each of these takes many hours. `code/fitting/sample_pooled_attention_weights.R`
-runs exactly this chunk from a terminal (so a closed R session can't kill it)
-and leaves the caches in `notebooks/brm_fits/`; after that the notebook only
-loads them.
+runs exactly this chunk from a terminal (so a closed R session can't kill it),
+optionally for one range at a time, and leaves the caches in
+`notebooks/brm_fits/`; after that the notebook only loads them.
 
 ```{r flex-fit-by-range}
 range_files <- c(
-  Narrow = "flex_attention_weights_pooled_narrow",
-  Wide   = "flex_attention_weights_pooled_wide"
+  Narrow = "attention_weights_utility_narrow",
+  Wide   = "attention_weights_utility_wide"
 )
 
+# The terminal script can set fit_ranges to a single range before running this chunk.
+if (!exists("fit_ranges")) fit_ranges <- c("Narrow", "Wide")
+
 flex_fit_range <- list()
-for (rng in c("Narrow", "Wide")) {
+for (rng in fit_ranges) {
   flex_dat <- build_flex_dat(rng)
   flex_fit_range[[rng]] <- load_or_fit(
     range_files[[rng]],
@@ -1374,78 +1576,173 @@ for (rng in names(flex_fit_range)) {
   }
 }
 
-# Draws of one cell weight, e.g. aw_draws("Narrow", "N_neg30", 2). Study 1 is
-# the reference level, so Study 2 is the Study 1 draws plus the cell's Study 2
-# interaction.
-aw_draws <- function(range, cell, study) {
-  d <- flex_draws[[range]]
-  if (study == 1) d[[paste0("b_", cell)]] else d[[paste0("b_", cell)]] + d[[paste0("b_", cell, ":Study2")]]
-}
+# Draws of one cell's attention weight, e.g. aw_draws("Narrow", "N_neg30"), and
+# of one cell's utility, e.g. u_draws("Narrow", "P_pos10"). The fits pool the
+# studies, so there is one population value per cell.
+aw_draws <- function(range, cell) flex_draws[[range]][[paste0("b_", cell)]]
+u_draws  <- function(range, cell) flex_draws[[range]][[paste0("b_U_", cell)]]
 
-# Median and 95% HDI of every cell weight in one range condition, by study,
-# with the cell name parsed back into a type and a value for plotting.
-summarise_flex_weights <- function(range) {
-  cells <- names(flex_draws[[range]]) %>% str_subset("^b_[PNB]_(neg|pos)[0-9]+$") %>% str_remove("^b_")
-  out <- tibble()
-  for (s in 1:2) {
-    for (cell in cells) {
-      x <- aw_draws(range, cell, s)
-      h <- bayestestR::hdi(x, ci = 0.95)
-      out <- bind_rows(out, tibble(Study = s, WN = range, term = cell,
-                                   estimate = median(x), lo = h$CI_low, hi = h$CI_high))
-    }
-  }
-  out %>% mutate(
-    type  = factor(str_sub(term, 1, 1), levels = c("N", "B", "P")),
-    value = as.numeric(str_extract(term, "[0-9]+$")) * if_else(str_detect(term, "_neg"), -1, 1)
+# Parse cell names such as "N_neg30" into a type and a value for plotting.
+parse_cells <- function(df) {
+  df %>% mutate(
+    type  = factor(str_sub(cell, 1, 1), levels = c("N", "B", "P")),
+    value = as.numeric(str_extract(cell, "[0-9]+$")) * if_else(str_detect(cell, "_neg"), -1, 1)
   )
 }
 
-# Signed attention weights by type and value, Narrow and Wide overlaid (one study).
-plot_weights_by_range <- function(weights, title) {
-  ggplot(weights, aes(x = value, y = estimate, color = WN, shape = WN)) +
+# Median and 95% HDI of every cell's attention weight in one range condition.
+summarise_flex_weights <- function(range) {
+  cells <- names(flex_draws[[range]]) %>% str_subset("^b_[PNB]_(neg|pos)[0-9]+$") %>% str_remove("^b_")
+  out <- tibble()
+  for (cell in cells) {
+    x <- aw_draws(range, cell)
+    h <- bayestestR::hdi(x, ci = 0.95)
+    out <- bind_rows(out, tibble(WN = range, cell = cell, estimate = median(x), lo = h$CI_low, hi = h$CI_high))
+  }
+  parse_cells(out)
+}
+
+# The same for the utilities. The reference of each type (its lowest value in
+# this range) is put back at 0 so that the whole value function can be drawn.
+summarise_flex_utilities <- function(range) {
+  cells <- names(flex_draws[[range]]) %>% str_subset("^b_U_") %>% str_remove("^b_U_")
+  out <- tibble()
+  for (cell in cells) {
+    x <- u_draws(range, cell)
+    h <- bayestestR::hdi(x, ci = 0.95)
+    out <- bind_rows(out, tibble(WN = range, cell = cell, estimate = median(x), lo = h$CI_low, hi = h$CI_high))
+  }
+  refs <- boxlong %>%
+    filter(WN == range) %>%
+    distinct(type, value, cell) %>%
+    group_by(type) %>%
+    slice_min(value, n = 1) %>%
+    ungroup() %>%
+    transmute(WN = range, cell, estimate = 0, lo = 0, hi = 0)
+  parse_cells(bind_rows(out, refs))
+}
+
+# One quantity (attention weight or utility) by type and value, Narrow and
+# Wide overlaid.
+plot_by_range <- function(d, title, ylab, ylim = NULL) {
+  ggplot(d, aes(x = value, y = estimate, color = WN, shape = WN)) +
     facet_wrap(~ type, scales = "free_x", labeller = type_labels) +
     geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
     geom_line(linewidth = .linewidth, position = wn_dodge) +
     geom_pointrange(aes(ymin = lo, ymax = hi), size = pt_size, linewidth = .linewidth, position = wn_dodge) +
-    #stat_smooth(method = "lm", se = FALSE, linewidth = .linewidth) +
     wn_scales +
-    labs(x = "Attribute Value", y = "Attention Weight", title = title) +
+    labs(x = "Attribute Value", y = ylab, title = title) +
     .myPlot + type_strip_style + study_title + legend_right + theme(legend.direction = "vertical") +
-    coord_cartesian(ylim = c(-0.5, 0.5)) +
+    coord_cartesian(ylim = ylim) +
+    scale_x_continuous(breaks = x_attr_breaks)
+}
+
+# Data (points with their intervals, no connecting lines) and a model (lines,
+# no points) in the same panels, Narrow and Wide overlaid: geometry tells data
+# from model, color tells the range condition. The model's simulation error is
+# not drawn; it shrinks with the number of simulated choices.
+plot_overlay <- function(data_w, model_w, title, ylab, ylim = NULL) {
+  ggplot(mapping = aes(x = value, color = WN)) +
+    facet_wrap(~ type, scales = "free_x", labeller = type_labels) +
+    geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
+    geom_line(data = model_w, aes(y = estimate, group = WN), linewidth = .linewidth, position = wn_dodge) +
+    geom_pointrange(data = data_w, aes(y = estimate, ymin = lo, ymax = hi, shape = WN),
+                    size = pt_size, linewidth = .linewidth, position = wn_dodge) +
+    wn_scales +
+    labs(x = "Attribute Value", y = ylab, title = title) +
+    .myPlot + type_strip_style + study_title + legend_right + theme(legend.direction = "vertical") +
+    coord_cartesian(ylim = ylim) +
     scale_x_continuous(breaks = x_attr_breaks)
 }
 ```
 
-```{r flex-plots}
-# Cell weights of both range conditions, then one plot per study.
-weights_range <- tibble()
+```{r flex-plots, fig.width=2 * .figw, fig.height=1 * .figh}
+# Attention weights and utilities of both range conditions.
+weights_range   <- tibble()
+utilities_range <- tibble()
 for (rng in names(flex_draws)) {
-  weights_range <- bind_rows(weights_range, summarise_flex_weights(rng))
+  weights_range   <- bind_rows(weights_range,   summarise_flex_weights(rng))
+  utilities_range <- bind_rows(utilities_range, summarise_flex_utilities(rng))
 }
 
-p_weights_range <- list()
+p_weights_data <- NULL
+p_utilities    <- NULL
 if (nrow(weights_range) > 0) {
-  weights_range <- weights_range %>% mutate(WN = factor(WN, levels = c("Narrow", "Wide")))
-  for (s in 1:2) {
-    key <- paste0("Study ", s)
-    p_weights_range[[key]] <- plot_weights_by_range(weights_range %>% filter(Study == s), title = key)
+  weights_range   <- weights_range   %>% mutate(WN = factor(WN, levels = c("Narrow", "Wide")))
+  utilities_range <- utilities_range %>% mutate(WN = factor(WN, levels = c("Narrow", "Wide")))
+  p_weights_data <- plot_by_range(weights_range,   "Data",             "Attention Weight", c(-0.5, 0.5))
+  p_utilities    <- plot_by_range(utilities_range, "Utility by Value", "Utility (log-odds)")
+}
+
+# The value functions: utility of each value relative to the lowest value of
+# its type. Not in the paper; saved next to the paper's figures for reference.
+if (!is.null(p_utilities)) {
+  ggsave(file.path(fig_dir, "attribute_level_utilities.pdf"), p_utilities, width = 2 * .figw, height = 1 * .figh)
+}
+p_utilities
+```
+
+### Bayesian model
+
+The main Bayesian model: one prior per range condition, with loss aversion.
+Every trial's choice probability is held out (12-fold cross-validation, blocks
+of five trial positions per subject, every fold fit from scratch), so the
+model never saw the trial it predicts. Ten replicates of one choice per
+trial are drawn from those probabilities, and each replicate is run through
+the same regression as the data, with the same brms model, priors and
+sampler, as its own dataset (so the hierarchical model sees the data's
+design), on Compute Canada (`code/fitting/compute_canada_attention_weights.R`;
+`bayesian_model.Rmd` does the same for every model variant). Only a compact
+summary of each fit comes back,
+`notebooks/brm_fits/attention_weights_utility_sim_cond_lam_<range>_rep<k>_draws.rds`.
+The chunk pools the replicates by stacking their draws (the average of their
+posteriors) and takes the median and 95% HDI of every cell weight; the
+overlay draws only the medians.
+
+```{r bayes-weights}
+# The held-out predictions of the main model; the Extra Analyses section
+# reads them for the participants' log-likelihoods.
+bayes_loo_file <- file.path(bayes_dir, "loo_cond_lam.rds")
+
+# The cluster fits of the main model's simulated choices: one file per
+# replicate and range condition, holding the population-level draws of the
+# same brms model as the data's. The replicates' draws are stacked (the
+# average of their posteriors); posterior median and 95% HDI of every cell
+# weight, parsed into type and value.
+weights_model <- tibble()
+for (rng in c("Narrow", "Wide")) {
+  files <- list.files(fit_dir, full.names = TRUE,
+                      pattern = paste0("^attention_weights_utility_sim_cond_lam_", tolower(rng), "_rep[0-9]+_draws\\.rds$"))
+  if (length(files) == 0) { cat("No cluster fit for cond_lam", rng, "in", fit_dir, "\n"); next }
+  cat(rng, ": ", length(files), " replicate(s)\n", sep = "")
+  draws <- bind_rows(lapply(files, function(f) as_tibble(readRDS(f)$draws) %>% select(matches("^b_"))))
+  for (cell in names(draws) %>% str_subset("^b_[PNB]_(neg|pos)[0-9]+$") %>% str_remove("^b_")) {
+    x <- draws[[paste0("b_", cell)]]
+    h <- bayestestR::hdi(x, ci = 0.95)
+    weights_model <- bind_rows(weights_model, tibble(WN = rng, cell = cell, estimate = median(x), lo = h$CI_low, hi = h$CI_high))
   }
+}
+if (nrow(weights_model) > 0) {
+  weights_model <- weights_model %>% mutate(WN = factor(WN, levels = c("Narrow", "Wide"))) %>% parse_cells()
+}
+
+# The right panel of the figure.
+p_weights_model <- NULL
+if (nrow(weights_model) > 0) {
+  p_weights_model <- plot_by_range(weights_model, "Bayesian Model", "Attention Weight", c(-0.5, 0.5))
 }
 ```
 
+### Combined figure
+
 ```{r fig-attribute-level, fig.width=2 * .figw, fig.height=1 * .figh}
-# A missing fit leaves an empty panel rather than breaking the layout.
-get_or_spacer <- function(plots, key) {
-  if (is.null(plots[[key]])) plot_spacer() else plots[[key]]
-}
-
-# 1 row x 2 columns (Study 1, Study 2). Only saved when the fits exist, so a
+# Data (points with 95% HDIs, from the brms fits) and the Bayesian model
+# (lines: posterior medians of the same brms model on its out-of-sample simulated choices),
+# Narrow and Wide overlaid in one panel. Only saved when both exist, so a
 # figures-only pass without the caches doesn't overwrite the paper's figure.
-fig_attr <- (get_or_spacer(p_weights_range, "Study 1") | get_or_spacer(p_weights_range, "Study 2")) +
-  plot_layout(guides = "collect")
-
-if (length(p_weights_range) == 2) {
+fig_attr <- NULL
+if (nrow(weights_range) > 0 && nrow(weights_model) > 0) {
+  fig_attr <- plot_overlay(weights_range, weights_model, NULL, "Attention Weight", c(-0.5, 0.5))
   ggsave(file.path(fig_dir, "attribute_level_attention.pdf"), fig_attr, width = 2 * .figw, height = 1 * .figh)
 }
 fig_attr
@@ -1453,29 +1750,162 @@ fig_attr
 
 ## Tables
 
-Population-level coefficients from the two brms fits (posterior median and 95%
-HDI), one table per range condition. Cells are labeled "type, value"; the
-"× Study 2" column is the Study 2 minus Study 1 difference. The Bayesian R2
-takes a minute or two per fit.
+Population-level coefficients of the two brms fits (posterior median and 95%
+HDI) in one table: Narrow and Wide are the columns, the utilities (with the
+intercept and the Study 2 term) are Panel A and the attention weights Panel B.
+Rows are aligned by cell, so a value that only one range shows is blank in the
+other column. Panel A also prints each type's reference, its lowest value, as
+"0 (reference)". The Bayesian R2 takes a minute or two per fit.
 
 ```{r flex-tables}
 if (RUN_REGRESSIONS && length(flex_draws) == 2) {
+  panel_a <- list()
+  panel_b <- list()
+  sds     <- list()
   for (rng in c("Narrow", "Wide")) {
-    fit  <- flex_fit_range[[rng]]
-    tab  <- table_columns(order_cells(tidy_brms(fit)), gof_brms(fit), study_columns)
-    note <- sd_note(list(sds_brms(fit)), intro = "Random-effect SDs across subjects (posterior medians).")
-    # 22 rows would run off the page with the intervals underneath, and two
-    # columns leave room for them on the same line.
-    save_tex(tab, paste0("attribute_level_attention_weights_", tolower(rng)), note, ci_inline = TRUE)
+    fit   <- flex_fit_range[[rng]]
+    coefs <- order_cells(tidy_brms(fit))
+    is_w  <- str_detect(coefs$term, "^[PNB]_(neg|pos)[0-9]+$")   # the attention weights
+    # Panel A also lists each type's reference: its lowest value, whose utility
+    # is fixed at zero by construction and so has no coefficient in the fit. It
+    # is the one cell of the type that has a weight but no utility.
+    cells   <- coefs$term[is_w]
+    ref     <- cells[!paste0("U_", cells) %in% coefs$term]
+    stopifnot(length(ref) == 3)   # one per type
+    ref_row <- tibble(term = paste0("U_", ref), estimate = 0, conf.low = NA_real_, conf.high = NA_real_,
+                      text = "0 (reference)")
+    utilities <- order_cells(bind_rows(coefs[!is_w, ], ref_row))
+    # The fit statistics go under Panel B, at the bottom of the table.
+    panel_a[[rng]] <- table_columns(utilities, tibble(), c("ref" = rng))[[1]]
+    panel_b[[rng]] <- table_columns(coefs[is_w, ],  gof_brms(fit), c("ref" = rng))[[1]]
+    s <- sds_brms(fit)
+    sds[[paste0(rng, ", utilities")]] <- s[str_detect(names(s), "^U_")]
+    sds[[paste0(rng, ", weights")]]   <- s[!str_detect(names(s), "^U_")]
   }
+  tab <- list(
+    "Panel A: Utility of each value, relative to the lowest value of its type" = panel_a,
+    "Panel B: Attention weight per second of dwell"                            = panel_b
+  )
+  # Rows in type and value order over the union of both ranges' cells (left to
+  # itself, modelsummary would put the Wide-only values at the bottom).
+  all_cells <- unique(unlist(lapply(flex_draws, function(d) {
+    names(d) %>% str_subset("^b_[PNB]_(neg|pos)[0-9]+$") %>% str_remove("^b_")
+  })))
+  row_order <- c("Intercept", "Study 2", label_term(all_cells[cell_order(all_cells)]))
+  save_tex(tab, "attribute_level_attention",
+           sd_note(sds, intro = paste("A blank cell is a value that does not occur in that range condition.",
+                                      "Random-effect SDs across subjects (posterior medians).")),
+           ci_inline = TRUE, coef_order = row_order)
 }
 ```
 
 ## Text Output
 
-The attention weights quoted in the Attribute-Level Attention paragraphs of the
-paper. Each snippet reports one attribute value per range condition, for both
-studies, as `fmt_post(aw_draws(range, cell, study))`.
+The attention weights quoted in the Attribute-Level Attention paragraphs of
+the paper. Each snippet reports one attribute value per range condition as
+`fmt_post(aw_draws(range, cell))`, written
+`$\omega^{\text{Narrow}, -30} = -0.132\ [-0.219, -0.055]$`.
+
+```{r text-attn-helpers}
+# One attention weight in the paper's notation: range condition in the
+# superscript, attribute type in the subscript, the value in parentheses, e.g.
+# omega_label("\\text{Narrow}", "N_neg30") -> \omega^{\text{Narrow}}_{\text{N}}(-30).
+omega_label <- function(sup, cell) {
+  v <- str_extract(cell, "[0-9]+$")
+  if (str_detect(cell, "_neg")) v <- paste0("-", v)
+  paste0("\\omega^{", sup, "}_{\\text{", str_sub(cell, 1, 1), "}}(", v, ")")
+}
+
+# One snippet from the cells of each range, e.g.
+# list(Narrow = c("N_neg30", "N_neg25"), Wide = c("N_neg50", "N_neg40")) ->
+# "$\omega^{\text{Narrow}}_{\text{N}}(-30) = -0.211\ [-0.287, -0.134]$, ...",
+# the Narrow cells first, each range's cells in the order given. A named
+# vector with one cell per range works too.
+omega_text <- function(cells, digits = 3) {
+  out <- c()
+  for (rng in names(cells)) {
+    for (cell in cells[[rng]]) {
+      out <- c(out, paste0("$", omega_label(paste0("\\text{", rng, "}"), cell), " = ",
+                           fmt_post(aw_draws(rng, cell), digits), "$"))
+    }
+  }
+  paste(out, collapse = ", ")
+}
+
+# The Narrow minus Wide difference of one cell's weight: the two fits are
+# independent, so the difference of draws is the posterior of the difference.
+omega_diff_text <- function(cell, digits = 3) {
+  paste0("$", omega_label("\\text{Narrow} - \\text{Wide}", cell), " = ",
+         fmt_post(aw_draws("Narrow", cell) - aw_draws("Wide", cell), digits), "$")
+}
+
+# The difference between two attribute types at the values they share, e.g.
+# omega_type_diff_text("B", "P") -> "$\omega^{\text{Narrow}}_{\text{B} - \text{P}}(5) = ...$, ...":
+# type a minus type b, at every value both types take in a range (from the
+# design), Narrow first. Both weights come from the same range's fit, so the
+# difference of draws is the posterior of the difference.
+cell_name <- function(type, value) paste0(type, "_", if_else(value < 0, "neg", "pos"), abs(value))
+omega_type_diff_text <- function(a, b, digits = 3) {
+  out <- c()
+  for (rng in c("Narrow", "Wide")) {
+    vals <- boxlong %>% filter(WN == rng) %>% distinct(type, value)
+    shared <- sort(intersect(vals$value[vals$type == a], vals$value[vals$type == b]))
+    for (v in shared) {
+      d <- aw_draws(rng, cell_name(a, v)) - aw_draws(rng, cell_name(b, v))
+      out <- c(out, paste0("$\\omega^{\\text{", rng, "}}_{\\text{", a, "} - \\text{", b, "}}(", v, ") = ",
+                           fmt_post(d, digits), "$"))
+    }
+  }
+  paste(out, collapse = ", ")
+}
+write_attn <- RUN_REGRESSIONS && length(flex_draws) == 2
+```
+
+```{r text-attn-aversive}
+if (write_attn) {
+  # The two lowest aversive values of each range: -30, -25 (Narrow); -50, -40 (Wide).
+  save_text(omega_text(list(Narrow = c("N_neg30", "N_neg25"), Wide = c("N_neg50", "N_neg40"))), "attn_N_lowest")
+  # The two middle values: -20, -15 (Narrow); -30, -20 (Wide).
+  save_text(omega_text(list(Narrow = c("N_neg20", "N_neg15"), Wide = c("N_neg30", "N_neg20"))), "attn_N_middle")
+  # The two highest (still negative) values, -10 and -5 in both ranges.
+  save_text(omega_text(list(Narrow = c("N_neg10", "N_neg5"), Wide = c("N_neg10", "N_neg5"))), "attn_N_highest")
+  # The maximum aversive value on its own, -5 in both ranges.
+  save_text(omega_text(c(Narrow = "N_neg5", Wide = "N_neg5")), "attn_N_max")
+  # The one middle value whose interval does not include 0: -40 in Wide.
+  save_text(omega_text(c(Wide = "N_neg40")), "attn_N_neg40_wide")
+  # -30 is the lowest value in Narrow but a middle value in Wide: each range's
+  # weight, and the Narrow minus Wide difference.
+  save_text(omega_text(c(Narrow = "N_neg30")), "attn_N_neg30_narrow")
+  save_text(omega_text(c(Wide = "N_neg30")), "attn_N_neg30_wide")
+  save_text(omega_diff_text("N_neg30"), "attn_N_neg30_diff")
+}
+```
+
+```{r text-attn-appetitive}
+if (write_attn) {
+  # The two highest appetitive values of each range: 25, 30 (Narrow); 40, 50 (Wide).
+  save_text(omega_text(list(Narrow = c("P_pos25", "P_pos30"), Wide = c("P_pos40", "P_pos50"))), "attn_P_highest")
+  # A middle appetitive value: 20 (Narrow), 30 (Wide).
+  save_text(omega_text(c(Narrow = "P_pos20", Wide = "P_pos30")), "attn_P_middle")
+  # The two lowest appetitive values, 5 and 10 in both ranges.
+  save_text(omega_text(list(Narrow = c("P_pos5", "P_pos10"), Wide = c("P_pos5", "P_pos10"))), "attn_P_lowest")
+  # The minimum appetitive value on its own, 5 in both ranges.
+  save_text(omega_text(c(Narrow = "P_pos5", Wide = "P_pos5")), "attn_P_min")
+  # 30 is the highest value in Narrow but a middle value in Wide: the Narrow
+  # minus Wide difference.
+  save_text(omega_diff_text("P_pos30"), "attn_P_pos30_diff")
+}
+```
+
+```{r text-attn-ambivalent}
+if (write_attn) {
+  # Ambivalent minus appetitive at the positive values both types take
+  # (5, 10, 15 in Narrow; 5, 10, 20 in Wide), and ambivalent minus aversive at
+  # the negative values both take (-15, -10, -5 in Narrow; -20, -10, -5 in Wide).
+  save_text(omega_type_diff_text("B", "P"), "attn_B_P_compare")
+  save_text(omega_type_diff_text("B", "N"), "attn_B_N_compare")
+}
+```
 
 ---
 
@@ -1595,6 +2025,391 @@ in this section runs unless the switch below is TRUE.
 
 ```{r extra-switch}
 run_extra_analyses <- FALSE
+```
+
+## Attention weights with linear value channels, by study (pre-registered)
+
+The pre-registered attention-weight model, which the paper used as its main
+model before the per-value utilities (see the Attribute-Level Attention
+section): the three signed values enter as linear channels (`SV_P`, `SV_N`,
+`SV_B`) instead of one utility per value, and every coefficient is crossed
+with study (Study 1 is the reference level, so a Study 2 weight is the Study 1
+weight plus the cell's `:Study2` interaction). Because it was pre-registered
+it is reported in the last supplementary section of the paper, so this
+subsection writes its figure (`paper/figures/attribute_level_attention_preregistered.pdf`)
+and its two tables (`paper/tables/attribute_level_attention_weights_preregistered_narrow.tex`
+and `_wide.tex`) when the switch above is on.
+
+It also does two jobs for the main text. Its by-study weights are the
+evidence that the two studies agree, which justifies pooling them in the main
+model: they correlate at 0.81 across the 36 cells, and 4 of the 36
+cell-by-study interactions exclude zero, about what chance gives at 95%. And
+it shows what the linear channel does to a cell weight: dwell on a shown box
+is always positive, so any gap between a value's utility and the line lands on
+that cell's dwell weight. That is why the P, 5 weight in Narrow is clearly
+positive here and not in the main model. The cached fits are the ones sampled
+in October 2026.
+
+```{r extra-linear-fit}
+if (run_extra_analyses) {
+  # Like build_flex_dat(), with the three signed value channels in place of
+  # the utility columns.
+  build_flex_dat_linear <- function(range, bl = boxlong, ps = pas) {
+    bl <- bl %>% filter(WN == range)
+    ps <- ps %>% filter(WN == range)
+    dwell_design <- bl %>%
+      group_by(Subject, Trial, cell) %>%
+      summarise(sd = sum(signed_dwell), .groups = "drop") %>%
+      pivot_wider(names_from = cell, values_from = sd, values_fill = 0)
+    # Signed value per attribute type. These three sum to Diff / 10.
+    value_design <- bl %>%
+      group_by(Subject, Trial, type) %>%
+      summarise(SV = sum(signed_value), .groups = "drop") %>%
+      pivot_wider(names_from = type, values_from = SV, names_prefix = "SV_", values_fill = 0)
+    ps %>%
+      transmute(Subject, Trial, ChooseL, Study = factor(Study)) %>%
+      left_join(value_design, by = c("Subject", "Trial")) %>%
+      left_join(dwell_design, by = c("Subject", "Trial"))
+  }
+
+  # Every value channel and cell weight crossed with study, plus subject-level
+  # random slopes on the value channels and on every cell.
+  build_flex_formula_linear <- function(dat) {
+    value_cols <- c("SV_P", "SV_N", "SV_B")
+    as.formula(paste(
+      "ChooseL ~ (", paste(c(value_cols, dwell_cols(dat)), collapse = " + "), ") * Study",
+      "+ (0 + SV_P + SV_N + SV_B | Subject)",
+      "+ (0 +", paste(dwell_cols(dat), collapse = " + "), "| Subject)"
+    ))
+  }
+
+  linear_files <- c(
+    Narrow = "flex_attention_weights_pooled_narrow",
+    Wide   = "flex_attention_weights_pooled_wide"
+  )
+  linear_fit <- list()
+  for (rng in c("Narrow", "Wide")) {
+    linear_dat <- build_flex_dat_linear(rng)
+    linear_fit[[rng]] <- load_or_fit(
+      linear_files[[rng]],
+      formula = build_flex_formula_linear(linear_dat),
+      data    = linear_dat,
+      family  = bernoulli(),
+      prior   = brms_priors,
+      chains  = BRMS_CHAINS, iter = 4000, seed = BRMS_SEED,
+      control = list(adapt_delta = 0.95, max_treedepth = 12)
+    )
+  }
+}
+```
+
+```{r extra-linear-plots, fig.width=2 * .figw, fig.height=1 * .figh}
+if (run_extra_analyses) {
+  linear_draws <- list()
+  for (rng in names(linear_fit)) {
+    if (!is.null(linear_fit[[rng]])) {
+      linear_draws[[rng]] <- as_draws_df(linear_fit[[rng]], variable = "^b_", regex = TRUE)
+    }
+  }
+
+  # Draws of one cell weight for one study, e.g. aw_draws_linear("Narrow", "N_neg30", 2).
+  aw_draws_linear <- function(range, cell, study) {
+    d <- linear_draws[[range]]
+    if (study == 1) d[[paste0("b_", cell)]] else d[[paste0("b_", cell)]] + d[[paste0("b_", cell, ":Study2")]]
+  }
+
+  # Median and 95% HDI of every cell weight, by range and study.
+  weights_linear <- tibble()
+  for (rng in names(linear_draws)) {
+    cells <- names(linear_draws[[rng]]) %>% str_subset("^b_[PNB]_(neg|pos)[0-9]+$") %>% str_remove("^b_")
+    for (s in 1:2) {
+      for (cell in cells) {
+        x <- aw_draws_linear(rng, cell, s)
+        h <- bayestestR::hdi(x, ci = 0.95)
+        weights_linear <- bind_rows(weights_linear, tibble(
+          Study = s, WN = rng, cell = cell, estimate = median(x), lo = h$CI_low, hi = h$CI_high
+        ))
+      }
+    }
+  }
+
+  # One panel per study, Narrow and Wide overlaid. Saved for the supplement.
+  p_linear <- list()
+  if (nrow(weights_linear) > 0) {
+    weights_linear <- parse_cells(weights_linear) %>% mutate(WN = factor(WN, levels = c("Narrow", "Wide")))
+    for (s in 1:2) {
+      key <- paste0("Study ", s)
+      p_linear[[key]] <- plot_by_range(weights_linear %>% filter(Study == s), key, "Attention Weight", c(-0.5, 0.5))
+    }
+  }
+  fig_linear <- (get_or_spacer(p_linear, "Study 1") | get_or_spacer(p_linear, "Study 2")) + plot_layout(guides = "collect")
+  if (length(p_linear) == 2) {
+    ggsave(file.path(fig_dir, "attribute_level_attention_preregistered.pdf"), fig_linear, width = 2 * .figw, height = 1 * .figh)
+  }
+  fig_linear
+}
+```
+
+```{r extra-linear-tables}
+if (run_extra_analyses) {
+  # One table per range: the Study 1 coefficient and its Study 2 interaction.
+  # These are the file names the paper's supplement inputs.
+  for (rng in c("Narrow", "Wide")) {
+    fit  <- linear_fit[[rng]]
+    tab  <- table_columns(order_cells(tidy_brms(fit)), gof_brms(fit), study_columns)
+    note <- sd_note(list(sds_brms(fit)), intro = "Random-effect SDs across subjects (posterior medians).")
+    save_tex(tab, paste0("attribute_level_attention_weights_preregistered_", tolower(rng)), note, ci_inline = TRUE)
+  }
+}
+```
+
+```{r extra-linear-text}
+if (run_extra_analyses && length(linear_draws) == 2) {
+  # How well the two studies agree in the pre-registered model, quoted in the
+  # supplement: the correlation between the Study 1 and Study 2 cell weights
+  # across all 36 cells (18 per range), and how many of the 36 cell x Study 2
+  # interactions have a 95% HDI that excludes 0 (1.8 expected by chance).
+  by_study <- weights_linear %>%
+    select(WN, cell, Study, estimate) %>%
+    pivot_wider(names_from = Study, values_from = estimate, names_prefix = "S")
+  n_excl <- 0
+  for (rng in names(linear_draws)) {
+    d <- linear_draws[[rng]]
+    for (v in names(d) %>% str_subset("^b_[PNB]_(neg|pos)[0-9]+:Study2$")) {
+      h <- bayestestR::hdi(d[[v]], ci = 0.95)
+      if (h$CI_low > 0 || h$CI_high < 0) n_excl <- n_excl + 1
+    }
+  }
+  save_text(sprintf("$r = %.2f$ across the %d cells; %d of %d $\\times$ Study 2 interactions exclude 0",
+                    cor(by_study$S1, by_study$S2), nrow(by_study), n_excl, nrow(by_study)),
+            "attn_prereg_agreement")
+}
+```
+
+## Attention weights by study (utility model)
+
+Robustness check for pooling the two studies in the main model: the same
+per-value-utility model as the Attribute-Level Attention section, with every
+population-level coefficient (the intercept, the 15 utilities, and the 18
+attention weights) crossed with study. Study 1 is the reference level, so a
+Study 2 coefficient is the Study 1 coefficient plus its `:Study2` interaction.
+The random slopes are those of the main model (uncorrelated on the utilities,
+correlated on the weights). One fit per range condition, sampled from a
+terminal with `code/fitting/sample_bystudy_attention_weights.R` (many hours
+each). When the switch above is on, this subsection writes the figure
+(`paper/figures/attribute_level_attention_by_study.pdf`), the two tables
+(`paper/tables/attribute_level_attention_by_study_narrow.tex` and `_wide.tex`)
+and the snippets (`attn_bystudy_corr`, `attn_bystudy_siginteractions`, and
+`util_bystudy_siginteractions` for the utility interactions) of the paper's
+"Attention Weights by Study" supplementary section.
+
+Both fits were sampled on 4-5 November 2026 (7.4 and 6.0 hours). They are
+clean on every population-level parameter (no divergences, no treedepth hits,
+Rhat at most 1.003, bulk ESS at least 2,500); a few subject-level correlations
+in Wide mix more slowly (one Rhat of 1.04 with a bulk ESS of 119), and nothing
+below uses them. The Study 1 and Study 2 weights correlate at 0.77 across the
+36 cells, and 5 of the 36 weight interactions exclude 0 (1.8 by chance): the
+lowest aversive value in Wide (-0.305 in Study 1, -0.072 in Study 2), the two
+lowest ambivalent values in Narrow, and the 20 and 30 appetitive values in
+Wide. The utilities differ more between the studies: 8 of the 30 utility
+interactions exclude 0, all in Wide, where Study 2's utilities rise more
+steeply over the lowest aversive values and less steeply over the upper
+ambivalent and appetitive values.
+
+```{r extra-bystudy-fit}
+if (run_extra_analyses) {
+  # The main model's design matrix (build_flex_dat() keeps Study as a factor);
+  # the Study 2 intercept term S2 is replaced by the Study interactions.
+  build_flex_formula_bystudy <- function(dat) {
+    as.formula(paste(
+      "ChooseL ~ (1 +", paste(c(util_cols(dat), dwell_cols(dat)), collapse = " + "), ") * Study",
+      "+ (0 +", paste(util_cols(dat),  collapse = " + "), "|| Subject)",
+      "+ (0 +", paste(dwell_cols(dat), collapse = " + "), "| Subject)"
+    ))
+  }
+
+  bystudy_files <- c(
+    Narrow = "attention_weights_utility_bystudy_narrow",
+    Wide   = "attention_weights_utility_bystudy_wide"
+  )
+  # The terminal script can set bystudy_ranges to a single range before running this chunk.
+  if (!exists("bystudy_ranges")) bystudy_ranges <- c("Narrow", "Wide")
+
+  bystudy_fit <- list()
+  for (rng in bystudy_ranges) {
+    bystudy_dat <- build_flex_dat(rng) %>% select(-S2)
+    bystudy_fit[[rng]] <- load_or_fit(
+      bystudy_files[[rng]],
+      formula = build_flex_formula_bystudy(bystudy_dat),
+      data    = bystudy_dat,
+      family  = bernoulli(),
+      prior   = brms_priors,
+      chains  = BRMS_CHAINS, iter = 4000, seed = BRMS_SEED,
+      control = list(adapt_delta = 0.95, max_treedepth = 12)
+    )
+  }
+}
+```
+
+```{r extra-bystudy-plots, fig.width=2 * .figw, fig.height=1 * .figh}
+if (run_extra_analyses) {
+  bystudy_draws <- list()
+  for (rng in names(bystudy_fit)) {
+    if (!is.null(bystudy_fit[[rng]])) {
+      bystudy_draws[[rng]] <- as_draws_df(bystudy_fit[[rng]], variable = "^b_", regex = TRUE)
+    }
+  }
+
+  # Draws of one coefficient for one study: the Study 1 draw, or the Study 1
+  # draw plus its Study 2 interaction. `par` is an attention weight such as
+  # "N_neg30" or a utility such as "U_N_neg25".
+  bystudy_draws_of <- function(range, par, study) {
+    d <- bystudy_draws[[range]]
+    if (study == 1) d[[paste0("b_", par)]] else d[[paste0("b_", par)]] + d[[paste0("b_", par, ":Study2")]]
+  }
+
+  # Median and 95% HDI of every attention weight and every utility, by range
+  # and study. As in the main model's figures, each type's reference (lowest)
+  # value is put back at 0 for the utilities.
+  weights_bystudy   <- tibble()
+  utilities_bystudy <- tibble()
+  for (rng in names(bystudy_draws)) {
+    pars <- names(bystudy_draws[[rng]]) %>% str_subset("^b_(U_)?[PNB]_(neg|pos)[0-9]+$") %>% str_remove("^b_")
+    refs <- boxlong %>%
+      filter(WN == rng) %>%
+      distinct(type, value, cell) %>%
+      group_by(type) %>%
+      slice_min(value, n = 1) %>%
+      ungroup() %>%
+      pull(cell)
+    for (s in 1:2) {
+      for (par in pars) {
+        x   <- bystudy_draws_of(rng, par, s)
+        h   <- bayestestR::hdi(x, ci = 0.95)
+        row <- tibble(Study = s, WN = rng, cell = str_remove(par, "^U_"),
+                      estimate = median(x), lo = h$CI_low, hi = h$CI_high)
+        if (str_detect(par, "^U_")) {
+          utilities_bystudy <- bind_rows(utilities_bystudy, row)
+        } else {
+          weights_bystudy <- bind_rows(weights_bystudy, row)
+        }
+      }
+      utilities_bystudy <- bind_rows(utilities_bystudy,
+                                     tibble(Study = s, WN = rng, cell = refs, estimate = 0, lo = 0, hi = 0))
+    }
+  }
+
+  # One panel per study, Narrow and Wide overlaid: the attention weights (for
+  # the supplement) and the utilities (saved for reference).
+  p_w <- list()
+  p_u <- list()
+  if (nrow(weights_bystudy) > 0) {
+    weights_bystudy   <- parse_cells(weights_bystudy)   %>% mutate(WN = factor(WN, levels = c("Narrow", "Wide")))
+    utilities_bystudy <- parse_cells(utilities_bystudy) %>% mutate(WN = factor(WN, levels = c("Narrow", "Wide")))
+    for (s in 1:2) {
+      key <- paste0("Study ", s)
+      p_w[[key]] <- plot_by_range(weights_bystudy   %>% filter(Study == s), key, "Attention Weight", c(-0.5, 0.5))
+      p_u[[key]] <- plot_by_range(utilities_bystudy %>% filter(Study == s), key, "Utility (log-odds)")
+    }
+  }
+  fig_bystudy_weights   <- (get_or_spacer(p_w, "Study 1") | get_or_spacer(p_w, "Study 2")) + plot_layout(guides = "collect")
+  fig_bystudy_utilities <- (get_or_spacer(p_u, "Study 1") | get_or_spacer(p_u, "Study 2")) + plot_layout(guides = "collect")
+  if (length(p_w) == 2) {
+    ggsave(file.path(fig_dir, "attribute_level_attention_by_study.pdf"), fig_bystudy_weights,   width = 2 * .figw, height = 1 * .figh)
+    ggsave(file.path(fig_dir, "attribute_level_utilities_by_study.pdf"), fig_bystudy_utilities, width = 2 * .figw, height = 1 * .figh)
+  }
+  print(fig_bystudy_weights)
+  fig_bystudy_utilities
+}
+```
+
+```{r extra-bystudy-tables}
+if (run_extra_analyses) {
+  # One table per range, laid out like the main table (Panel A utilities,
+  # Panel B weights) but with the Study 1 coefficient and its Study 2
+  # interaction as the columns. These are the files the supplement inputs.
+  for (rng in names(bystudy_fit)) {
+    fit <- bystudy_fit[[rng]]
+    if (is.null(fit)) next
+    coefs <- order_cells(tidy_brms(fit))
+    is_w  <- str_detect(coefs$term, "^[PNB]_(neg|pos)[0-9]+(:Study2)?$")   # the attention weights
+    # Each type's reference (its lowest value) has no utility coefficient in
+    # either study: its Study 1 utility and its Study 2 shift are both zero by
+    # construction, so Panel A prints "0 (reference)" in both columns.
+    cells   <- unique(str_remove(coefs$term[is_w], ":Study2$"))
+    ref     <- cells[!paste0("U_", cells) %in% coefs$term]
+    stopifnot(length(ref) == 3)   # one per type
+    ref_row <- tibble(term = c(paste0("U_", ref), paste0("U_", ref, ":Study2")),
+                      estimate = 0, conf.low = NA_real_, conf.high = NA_real_, text = "0 (reference)")
+    utilities <- order_cells(bind_rows(coefs[!is_w, ], ref_row))
+    # The fit statistics go under Panel B only. table_columns() gives the
+    # second column a placeholder Num.Obs. row, which would print as an empty
+    # row under Panel A, so Panel A's columns get no fit statistics at all.
+    panel_a <- table_columns(utilities, tibble(), study_columns)
+    for (k in seq_along(panel_a)) panel_a[[k]]$glance <- tibble()
+    tab <- list(
+      "Panel A: Utility of each value, relative to the lowest value of its type" = panel_a,
+      "Panel B: Attention weight per second of dwell" =
+        table_columns(coefs[is_w, ], gof_brms(fit), study_columns)
+    )
+    s    <- sds_brms(fit)
+    note <- sd_note(list("Utilities" = s[str_detect(names(s), "^U_")], "Weights" = s[!str_detect(names(s), "^U_")]),
+                    intro = "Random-effect SDs across subjects (posterior medians).")
+    save_tex(tab, paste0("attribute_level_attention_by_study_", tolower(rng)), note, ci_inline = TRUE)
+  }
+}
+```
+
+```{r extra-bystudy-text}
+if (run_extra_analyses && length(bystudy_draws) == 2) {
+  # How well the two studies agree under the utility model, quoted in the
+  # supplement: the correlation between the Study 1 and Study 2 attention
+  # weights across all 36 cells (18 per range), and the Study 2 interactions
+  # (36 on the weights, 30 on the utilities) whose 95% HDI excludes 0, each
+  # with its posterior median and HDI (5% of each would by chance).
+  by_study <- weights_bystudy %>%
+    select(WN, cell, Study, estimate) %>%
+    pivot_wider(names_from = Study, values_from = estimate, names_prefix = "S")
+  # Pearson correlation of the 36 cell medians, with the p-value of its t-test (34 df).
+  ct <- cor.test(by_study$S1, by_study$S2)
+  save_text(sprintf("$r = %.2f$, $%s$", ct$estimate, fmt_p(ct$p.value)), "attn_bystudy_corr")
+
+  # A Study 2 interaction in the paper's notation: range condition in the
+  # superscript, attribute type and the Study 2 - Study 1 contrast in the
+  # subscript, the value in parentheses, e.g.
+  # \omega^{\text{Wide}}_{\text{N}, \text{Study 2} - \text{Study 1}}(-50);
+  # a utility interaction uses u in place of \omega.
+  bystudy_label <- function(rng, par) {
+    sym  <- if (str_detect(par, "^U_")) "u" else "\\omega"
+    cell <- str_remove(par, "^U_")
+    v    <- str_extract(cell, "[0-9]+$")
+    if (str_detect(cell, "_neg")) v <- paste0("-", v)
+    paste0(sym, "^{\\text{", rng, "}}_{\\text{", str_sub(cell, 1, 1), "}, \\text{Study 2} - \\text{Study 1}}(", v, ")")
+  }
+
+  # Narrow first, then Wide; within a range, the cells in type and value order.
+  n_excl <- c(weights = 0, utilities = 0)
+  n_tot  <- c(weights = 0, utilities = 0)
+  sig    <- list(weights = c(), utilities = c())
+  for (rng in names(bystudy_draws)) {
+    d    <- bystudy_draws[[rng]]
+    pars <- names(d) %>% str_subset("^b_(U_)?[PNB]_(neg|pos)[0-9]+:Study2$") %>% str_remove("^b_") %>% str_remove(":Study2$")
+    for (par in pars[cell_order(pars)]) {
+      x <- d[[paste0("b_", par, ":Study2")]]
+      h <- bayestestR::hdi(x, ci = 0.95)
+      k <- if (str_detect(par, "^U_")) "utilities" else "weights"
+      n_tot[[k]] <- n_tot[[k]] + 1
+      if (h$CI_low > 0 || h$CI_high < 0) {
+        n_excl[[k]] <- n_excl[[k]] + 1
+        sig[[k]]    <- c(sig[[k]], paste0("$", bystudy_label(rng, par), " = ", fmt_post(x), "$"))
+      }
+    }
+  }
+  cat(sprintf("%d of %d weight and %d of %d utility interactions exclude 0\n",
+              n_excl[["weights"]], n_tot[["weights"]], n_excl[["utilities"]], n_tot[["utilities"]]))
+  save_text(paste(sig$weights,   collapse = ", "), "attn_bystudy_siginteractions")
+  save_text(paste(sig$utilities, collapse = ", "), "util_bystudy_siginteractions")
+}
 ```
 
 ## Attention weights pooled across range conditions
@@ -1737,5 +2552,167 @@ if (run_extra_analyses) {
     )
   }
   lapply(val_fit_brms, tidy_brms)
+}
+```
+
+## Participant-level out-of-sample log-likelihood of the Bayesian model
+
+How large is the out-of-sample log-likelihood that one participant contributes
+to the model comparison (the table of estimates in the Bayesian model
+supplement)? A participant's total is the sum, over all of their trials, of the
+log probability that the main Bayesian model gave to the choice they made,
+when it was fit without that trial (the 12-fold cross-validation of
+`bayesian_model.Rmd`; `heldout_loglik` clips each probability to
+[1e-12, 1 - 1e-12], as in that comparison, and the clip never binds). A
+total is a sum over trials, and Study 1 participants have 24 to 30 trials
+against 50 to 60 in Study 2, so the mean and SD of the totals are given for
+each study. Needs only the cached held-out predictions, so it is quick, but
+like the rest of this section it runs only when the switch is TRUE. Snippet:
+`bayes_participant_ll`.
+
+```{r extra-participant-ll}
+if (run_extra_analyses && file.exists(bayes_loo_file)) {
+  # heldout_loglik lives in the Bayesian model's fitting code; load that file
+  # into its own environment so that its helper names don't mix with this
+  # notebook's.
+  fit_code <- new.env()
+  source(here::here("code/fitting/fit_bayesian_attributes.R"), local = fit_code)
+
+  # One row per participant: the total log-likelihood over their trials.
+  pred    <- readRDS(bayes_loo_file)$pred
+  pred$ll <- fit_code$heldout_loglik(pred)
+  ll_part <- pred %>%
+    group_by(Subject, Study) %>%
+    summarise(total = sum(ll), .groups = "drop")
+
+  # Mean and SD of the participants' totals, one pair per study (the study goes
+  # in the subscript).
+  by_study <- c()
+  for (s in 1:2) {
+    x <- ll_part$total[ll_part$Study == s]
+    by_study <- c(by_study, sprintf("$M_{\\text{Study %d}} = %.2f$, $SD_{\\text{Study %d}} = %.2f$", s, mean(x), s, sd(x)))
+  }
+  save_text(paste(by_study, collapse = "; "), "bayes_participant_ll")
+}
+```
+
+## Convergence of the Bayesian regressions
+
+Checks the two sentences in the paper's Methods: every Bayesian model
+converged with no divergent transitions, and every group-level parameter
+and subject-level random effect had $\hat{R} < 1.01$ and an effective sample
+size above 1,000. "Group-level parameters" are the population-level
+coefficients (`b_`, the estimates the tables report); the subject-level
+random effects are the `r_` terms. Both the bulk and the tail effective
+sample size must clear 1,000, and $\hat{R}$ is compared after rounding to two
+decimals, as it would be reported, so a value that rounds to 1.01 passes and
+one that rounds to 1.02 does not. The random-effect SDs and correlations are not
+part of the claim and are not checked (several of them mix more slowly; see
+the by-study section above). The models are the six brms fits of the data
+whose estimates the paper reports (the main attention-weight model of the
+Attribute-Level Attention section, its by-study version and the
+pre-registered linear-channel version, one fit per range condition) and the
+fits of the main Bayesian model's simulated choices that draw the model lines
+of the attribute-level figure; for those only the population-level draws and
+the sampler diagnostics were kept (see
+`code/fitting/compute_canada_attention_weights.R`), so their subject-level
+random effects cannot be checked. The table has one row per fit and level:
+the number of parameters, the divergent transitions, the largest $\hat{R}$,
+the smallest effective sample size and how many parameters miss either
+threshold; the parameters that miss one are listed after it, then the
+verdict. Every fit of the data is about 1.4 GB with tens of thousands of
+subject-level parameters, so this chunk is slow (about 17 minutes). Snippet:
+`brms_convergence`, the largest $\hat{R}$ and the smallest effective sample
+size over the checked parameters.
+
+```{r extra-brms-convergence}
+if (run_extra_analyses) {
+  # The fits of the data that the paper reports, one per range condition.
+  paper_fits <- c(
+    "Main, Narrow"           = "attention_weights_utility_narrow",
+    "Main, Wide"             = "attention_weights_utility_wide",
+    "By study, Narrow"       = "attention_weights_utility_bystudy_narrow",
+    "By study, Wide"         = "attention_weights_utility_bystudy_wide",
+    "Pre-registered, Narrow" = "flex_attention_weights_pooled_narrow",
+    "Pre-registered, Wide"   = "flex_attention_weights_pooled_wide"
+  )
+
+  # Which parameters the claim is about: b_ are the group-level parameters,
+  # r_ the subject-level random effects. Everything else (the random-effect
+  # SDs and correlations, lp__, lprior) is left out.
+  level_of <- function(variable) case_when(
+    str_starts(variable, "b_") ~ "group",
+    str_starts(variable, "r_") ~ "subject",
+    TRUE                       ~ "not checked"
+  )
+
+  # Rhat and the bulk and tail effective sample sizes of every checked
+  # parameter of every fit, plus the fit's divergent transitions. The fits of
+  # the data are read one at a time and dropped as soon as their diagnostics
+  # are out; the simulated-choice fits already carry theirs.
+  diags <- list()
+  for (nm in names(paper_fits)) {
+    file <- file.path(fit_dir, paste0(paper_fits[[nm]], ".rds"))
+    if (!file.exists(file)) { cat("No cached fit for", paper_fits[[nm]], "\n"); next }
+    fit <- readRDS(file)
+    d   <- posterior::summarise_draws(fit, "rhat", "ess_bulk", "ess_tail")
+    diags[[nm]] <- list(diag = d, divergences = sum(nuts_params(fit, pars = "divergent__")$Value))
+    rm(fit); gc()
+  }
+  for (rng in c("Narrow", "Wide")) {
+    files <- list.files(fit_dir, full.names = TRUE,
+                        pattern = paste0("^attention_weights_utility_sim_cond_lam_", tolower(rng), "_rep[0-9]+_draws\\.rds$"))
+    for (f in files) {
+      x  <- readRDS(f)
+      nm <- paste0("Simulated choices, ", rng, ", ", str_extract(basename(f), "rep[0-9]+"))
+      diags[[nm]] <- list(diag = x$summary, divergences = x$n_divergent)
+    }
+  }
+
+  # One row per fit and level: the number of parameters, the divergent
+  # transitions, the largest Rhat, the smallest effective sample size (bulk or
+  # tail) and how many parameters miss either threshold. The parameters that
+  # miss one are collected separately.
+  conv      <- tibble()
+  conv_fail <- tibble()
+  for (nm in names(diags)) {
+    d <- diags[[nm]]$diag %>%
+      mutate(level = level_of(variable)) %>%
+      filter(level != "not checked")
+    for (lv in c("group", "subject")) {
+      x <- d %>% filter(level == lv)
+      if (nrow(x) == 0) next
+      conv <- bind_rows(conv, tibble(
+        model = nm, level = lv, parameters = nrow(x), divergences = diags[[nm]]$divergences,
+        max_rhat = max(x$rhat), min_ess = min(c(x$ess_bulk, x$ess_tail)),
+        rhat_misses = sum(round(x$rhat, 2) > 1.01),   # Rhat as it would be reported, to two decimals
+        ess_misses  = sum(x$ess_bulk <= 1000 | x$ess_tail <= 1000)
+      ))
+    }
+    conv_fail <- bind_rows(conv_fail, d %>%
+      filter(round(rhat, 2) > 1.01 | ess_bulk <= 1000 | ess_tail <= 1000) %>%
+      mutate(model = nm) %>% select(model, level, variable, rhat, ess_bulk, ess_tail))
+  }
+  print(conv %>% mutate(max_rhat = round(max_rhat, 4), min_ess = round(min_ess)) %>% as.data.frame())
+
+  # The parameters that miss a threshold, worst Rhat first.
+  if (nrow(conv_fail) == 0) {
+    cat("No checked parameter misses a threshold.\n")
+  } else {
+    cat(nrow(conv_fail), "checked parameter(s) miss a threshold:\n")
+    print(conv_fail %>% arrange(desc(rhat)) %>% as.data.frame(), digits = 5)
+  }
+
+  # The verdict on the two sentences.
+  cat(sprintf("No divergent transitions in any model: %s (total %d)\n",
+              if (all(conv$divergences == 0)) "PASS" else "FAIL", sum(conv$divergences[!duplicated(conv$model)])))
+  cat(sprintf("Rhat < 1.01 (rounded to two decimals) and ESS > 1000 for every group-level parameter and subject-level random effect: %s (largest Rhat %.4f, smallest ESS %.0f)\n",
+              if (nrow(conv_fail) == 0) "PASS" else "FAIL", max(conv$max_rhat), min(conv$min_ess)))
+
+  # The snippet: the largest Rhat and the smallest effective sample size over
+  # the checked parameters of every fit.
+  save_text(sprintf("$\\max \\hat{R} = %.3f$, $\\min \\text{ESS} = %s$",
+                    max(conv$max_rhat), gsub(",", "{,}", format(round(min(conv$min_ess)), big.mark = ","))),   # 1{,}011: the comma LaTeX math needs
+            "brms_convergence")
 }
 ```

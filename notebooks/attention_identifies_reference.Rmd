@@ -1,0 +1,347 @@
+---
+title: "Is the reference point visible in choices without attention? (exploratory)"
+author: "Brenden Eum"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+    theme: flatly
+---
+
+Exploratory notebook. Nothing here is in the paper.
+
+**Question.** In the Bayesian model the prior mean $m_0$ is the reference
+point. Does anything in the choices tell us where $m_0$ is if we do not know how
+long each attribute was looked at? The algebra below says no (when there is no
+loss aversion). This notebook checks that with the project's own likelihood and
+asks how much of the information about the reference point comes from attention,
+and from which part of attention.
+
+What this notebook does **not** do: it fits no new model. It only evaluates the
+existing likelihood (`code/simulation/simulate_bayesian_attributes.R`,
+`code/fitting/fit_bayesian_attributes.R`) at a grid of reference points, with
+the dwell times left alone or changed in one of three ways. With $\lambda = 1$
+the probit is the exact choice probability, so there is no approximation here.
+
+Sections:
+
+1. The algebra
+2. Setup
+3. Four versions of the dwell data
+4. Likelihood over the reference point, $\lambda = 1$
+5. Results
+6. With loss aversion ($\lambda = 1.06$), does the kink identify the reference?
+7. Side result: how much of the box-level dwell does the model want?
+8. Notes
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  cache = FALSE,
+  fig.width = 8,
+  fig.height = 4.5,
+  dpi = 120
+)
+```
+
+# 1. The algebra
+
+Box $j$ has true value $a_j$ and was looked at for $t_j$ seconds. Its estimate
+is $m_j = m_0 + \pi_j(\bar{x}_j - m_0)$, where $\pi_j = \pi(t_j)$ is the
+relative precision of the sample and $\bar{x}_j \sim \mathcal{N}(a_j, \sigma_x^2/t_j)$.
+With $\lambda = 1$ the utility of a box is its estimate, and an option's utility is the
+sum of its two boxes. Left minus right:
+
+$$
+\Delta \;=\; \sum_{j \in L} \pi_j \bar{x}_j \;-\; \sum_{j \in R} \pi_j \bar{x}_j \;-\; m_0\,(\Pi_L - \Pi_R),
+\qquad \Pi_L = \sum_{j \in L} \pi_j, \quad \Pi_R = \sum_{j \in R} \pi_j .
+$$
+
+(Each option has two boxes, so the $2 m_0$ terms cancel.) The prior mean enters
+only through $\Pi_L - \Pi_R$: how much more precision the left option received
+than the right option. The variance of $\Delta$ does not contain $m_0$ at all.
+
+So if all four boxes of a trial are looked at for the same time,
+$\Pi_L = \Pi_R$, $m_0$ drops out, and the choice probability does not depend on
+$q$. Attention that differs between the options is the only thing that lets the
+choices say where the reference point is.
+
+# 2. Setup
+
+```{r libraries}
+library(tidyverse)
+
+# Project utilities: paths, the plot theme (.myPlot), colors, build_pas() / build_boxlong().
+source(here::here("code/utilities/getAllUtilities.R"))
+```
+
+```{r paths}
+data_dir   <- file.path(paths$root, paths$data$processed)
+cache_dir  <- file.path(paths$root, paths$results$cache, "bayesian_model")
+nb_fig_dir <- file.path(paths$root, paths$notebooks, "notebook_figures")
+dir.create(nb_fig_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r read-data}
+# Same data as the other notebooks: one row per box (option x attribute) with its value and dwell time.
+pas     <- build_pas(read_csv(file.path(data_dir, "main_data.csv"), show_col_types = FALSE))
+boxlong <- build_boxlong(pas)
+```
+
+```{r model-code}
+# The model and the fitting code (the main model is the variant cond_lam).
+source(here::here("code/simulation/simulate_bayesian_attributes.R"))
+source(here::here("code/fitting/fit_bayesian_attributes.R"))
+
+variants <- bayesian_variants()
+prep     <- prepare_boxes(boxlong, variants$cond_lam)   # trials with a never-hovered box are dropped here
+conds    <- names(prep$cond)                              # "Narrow" "Wide"
+
+# The cached full fit of the main model, only to mark its q on the figures.
+main_fit <- readRDS(file.path(cache_dir, "fit_cond_lam.rds"))
+cat("Main model: q =", round(main_fit$q, 3), " lambda =", round(main_fit$lambda[[1]], 3), "\n")
+cat(nrow(prep$all$trials), "trials,", nrow(prep$subjects), "subjects\n")
+```
+
+# 3. Four versions of the dwell data
+
+The likelihood reads each box's dwell time from the subject pieces
+(`prep$subj`). I make three copies of `prep` in which the dwell times are
+changed, and keep the original:
+
+- **real**: the dwell times as recorded.
+- **equal**: all four boxes of a trial get the trial's mean dwell. Total attention is kept, differences in attention between boxes are removed.
+- **option**: both boxes of an option get that option's mean dwell. The option that was looked at longer is still known, which attribute was looked at is not.
+- **shuffled**: the four dwell times of a trial are dealt out to the four boxes at random. The amount of attention and the size of the asymmetry between options are kept, but which box got the attention is now unrelated to the box's value.
+
+```{r change-dwell}
+change_dwell <- function(prep, version, seed = 1) {
+  set.seed(seed)
+  # Loop over subjects and replace the dwell column of that subject's boxes.
+  for (s in names(prep$subj)) {
+    b <- prep$subj[[s]]$boxes
+    if (version == "equal") {
+      b$dwell <- ave(b$dwell, b$trial_id)                          # mean over the four boxes of the trial
+    } else if (version == "option") {
+      b$dwell <- ave(b$dwell, b$trial_id, b$side_sign)             # mean over the two boxes of the same option
+    } else if (version == "shuffled") {
+      b$dwell <- ave(b$dwell, b$trial_id, FUN = function(x) x[sample.int(length(x))])   # random order within the trial
+    }
+    prep$subj[[s]]$boxes <- b
+  }
+  prep
+}
+
+versions <- c("real", "equal", "option", "shuffled")
+preps <- list()
+for (v in versions) preps[[v]] <- change_dwell(prep, v)
+```
+
+A check that the versions do what they say. Per trial: total dwell, and how
+much more the left option was looked at than the right option (absolute
+difference, in seconds).
+
+```{r check-dwell}
+check <- tibble()
+for (v in versions) {
+  b <- bind_rows(lapply(preps[[v]]$subj, function(p) p$boxes))
+  per_trial <- b %>%
+    group_by(Subject, Trial) %>%
+    summarise(total = sum(dwell),
+              asym  = abs(sum(dwell[side_sign == 1]) - sum(dwell[side_sign == -1])),
+              .groups = "drop")
+  check <- bind_rows(check, tibble(version = v,
+                                   mean_total_dwell = mean(per_trial$total),
+                                   mean_abs_left_minus_right = mean(per_trial$asym)))
+}
+check %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+# 4. Likelihood over the reference point, $\lambda = 1$
+
+For each version, I move $q$ over a grid (the same $q$ in both range conditions;
+the two conditions are independent given $q$, so each has its own curve). At
+every $q$ the population of sampling noise $(\mu, \tau)$ is re-fitted by
+`profile_cond()`, exactly as in Stage 1 of the paper's fitting procedure. The
+numbers are negative log-likelihoods (lower is better).
+
+```{r profile}
+q_grid       <- seq(-0.2, 0.8, by = 0.05)
+profile_file <- file.path(cache_dir, "attention_identifies_reference_lambda1.rds")
+
+if (file.exists(profile_file)) {
+  profile <- readRDS(profile_file)
+} else {
+  profile <- tibble()
+  for (v in versions) {
+    for (q in q_grid) {
+      par <- new_par(conds, s0_fixed_of(prep$variant), q, 1)    # lambda = 1, so the probit is exact
+      ll  <- grid_pass(preps[[v]], par)                          # every subject's log-likelihood on the sigma grid
+      for (cc in conds) {
+        pop     <- profile_cond(preps[[v]], cc, par, NULL, ll)   # best (mu, tau) of this condition at this q
+        profile <- bind_rows(profile, tibble(version = v, q = q, cond = cc, nll = pop$nll))
+      }
+    }
+  }
+  saveRDS(profile, profile_file)
+}
+profile$version <- factor(profile$version, levels = versions)
+```
+
+# 5. Results
+
+```{r summary-table}
+summary_rows <- tibble()
+for (v in versions) {
+  for (cc in conds) {
+    d    <- profile %>% filter(version == v, cond == cc)
+    best <- d %>% slice_min(nll, n = 1, with_ties = FALSE)
+    at0  <- d %>% filter(abs(q - 0.5) < 1e-9)                    # q = 0.5 puts the reference at 0 (the zero prior)
+    summary_rows <- bind_rows(summary_rows, tibble(
+      version              = v,
+      condition            = cc,
+      best_q_on_grid       = best$q,
+      nll_at_best          = best$nll,
+      range_over_q_grid    = max(d$nll) - min(d$nll),             # how far the likelihood moves over q in [-0.2, 0.8]
+      cost_of_zero_prior   = at0$nll - best$nll                   # NLL at q = 0.5 minus the best NLL
+    ))
+  }
+}
+summary_rows %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+```{r profile-figure}
+# Each curve is shifted so that its own minimum is 0: the height of a curve is
+# what is lost by putting the reference at the wrong place.
+plot_data <- profile %>%
+  group_by(version, cond) %>%
+  mutate(delta_nll = nll - min(nll)) %>%
+  ungroup()
+
+fitted_q <- tibble(cond = names(main_fit$q), q = unname(main_fit$q))
+
+p <- ggplot(plot_data, aes(q, delta_nll, color = version)) +
+  geom_vline(data = fitted_q, aes(xintercept = q), linetype = "dashed", color = "grey50") +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~ cond) +
+  scale_color_manual(values = c(real = "#E20778", equal = "#09AD87", option = "#FCAF17", shuffled = "#3E77B7"),
+                     name = "Dwell times") +
+  labs(x = "Reference point q (dashed line: fitted q of the main model)",
+       y = "Negative log-likelihood\nabove its minimum") +
+  .myPlot +
+  # .myPlot is sized for the paper's figures; smaller text for this notebook figure
+  theme(text = element_text(size = 11), axis.title = element_text(size = 11),
+        axis.text = element_text(size = 9), legend.title = element_text(size = 10),
+        legend.text = element_text(size = 9), legend.position = "right",
+        strip.text = element_text(size = 10), strip.background = element_blank())
+p
+ggsave(file.path(nb_fig_dir, "attention_identifies_reference.pdf"), p, width = 8, height = 3.6)
+```
+
+# 6. With loss aversion ($\lambda = 1.06$), does the kink identify the reference?
+
+With $\lambda \neq 1$ the utility has a kink at $m_0$, so the reference point
+gets a second footprint that does not need attention. The question is how large
+it is at the fitted loss aversion. The exact likelihood is needed here (the grid
+calculation in C++), so this is slower; the result is cached. Only the real and
+the equal versions, at three values of $q$.
+
+```{r kink}
+kink_file <- file.path(cache_dir, "attention_identifies_reference_kink.rds")
+lam_fit   <- main_fit$lambda[[1]]
+q_kink    <- c(0.0, 0.2, 0.4)
+
+if (file.exists(kink_file)) {
+  kink <- readRDS(kink_file)
+} else {
+  kink <- tibble()
+  for (v in c("real", "equal")) {
+    for (q in q_kink) {
+      par <- new_par(conds, s0_fixed_of(prep$variant), q, lam_fit)
+      ll  <- grid_pass(preps[[v]], par, exact = TRUE)
+      for (cc in conds) {
+        pop  <- profile_cond(preps[[v]], cc, par, NULL, ll)
+        kink <- bind_rows(kink, tibble(version = v, q = q, cond = cc, nll = pop$nll))
+      }
+    }
+  }
+  saveRDS(kink, kink_file)
+}
+
+kink %>%
+  group_by(version, cond) %>%
+  mutate(delta_nll = nll - min(nll)) %>%
+  ungroup() %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+# 7. Side result: how much of the box-level dwell does the model want?
+
+In section 5 the "option" version (both boxes of an option get the option's
+mean dwell) has a *lower* negative log-likelihood than the real dwell times.
+That is a statement about the main model, not about identification, so I
+checked it before trusting it. The blend below moves from the "option" version
+($a = 0$) to the real dwell times ($a = 1$):
+$$t'_j = a \, t_j + (1 - a) \, \bar{t}_{\text{option}(j)} .$$
+At every $a$ the reference point is re-optimised separately in each range
+condition (a bounded one-dimensional search, as in Stage 2 of the fitting).
+$\lambda = 1$, so the probit is exact. (Values of $a$ above 1 would exaggerate
+the within-option differences but give some boxes negative dwell, so they are
+not used.)
+
+```{r blend}
+blend_dwell <- function(prep, a) {
+  for (s in names(prep$subj)) {
+    b       <- prep$subj[[s]]$boxes
+    opt     <- ave(b$dwell, b$trial_id, b$side_sign)     # mean dwell of the box's option
+    b$dwell <- a * b$dwell + (1 - a) * opt
+    prep$subj[[s]]$boxes <- b
+  }
+  prep
+}
+
+blend_file <- file.path(cache_dir, "attention_identifies_reference_blend.rds")
+a_grid     <- c(0, 0.25, 0.5, 0.75, 1)     # a > 1 would give some boxes negative dwell
+
+if (file.exists(blend_file)) {
+  blend <- readRDS(blend_file)
+} else {
+  blend <- tibble()
+  for (a in a_grid) {
+    pa <- blend_dwell(prep, a)
+    for (cc in conds) {
+      subs <- pa$subjects$Subject[pa$subjects$WN == cc]
+      # negative log-likelihood of this condition as a function of q
+      f <- function(q) {
+        par <- new_par(conds, s0_fixed_of(prep$variant), q, 1)
+        ll  <- grid_pass(pa, par, subjects = subs)
+        profile_cond(pa, cc, par, NULL, ll)$nll
+      }
+      opt   <- optimize(f, interval = c(-0.2, 0.6))
+      blend <- bind_rows(blend, tibble(a = a, cond = cc, best_q = opt$minimum, nll = opt$objective))
+    }
+  }
+  saveRDS(blend, blend_file)
+}
+
+blend %>%
+  pivot_wider(names_from = cond, values_from = c(best_q, nll)) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+# 8. Notes
+
+Numbers are from the render of 2026-11-07 (they are in the tables above).
+
+- **The algebra holds in the code.** With equal dwell the likelihood does not move with $q$ at all (spread across the grid about $10^{-12}$ at $\lambda = 1$).
+- **The reference point is identified through attention.** With the real dwell times the likelihood has a clear minimum near $q = 0.2$ in both conditions, and putting the reference at 0 ($q = 0.5$) costs about 160 (Narrow) and 200 (Wide) log-likelihood units.
+- **It is the link between attention and value that matters, not attention as such.** With the dwell times shuffled across the four boxes of a trial (same amounts, same asymmetries between options) the best reference point is $q = 0.5$, the middle of the span, where it has no effect on choices.
+- **Option-level asymmetry is enough to locate it.** With option-level dwell the minimum is near $q = 0.15$.
+- **Loss aversion gives the reference a second, weaker footprint.** At the fitted $\lambda = 1.06$ the equal-dwell likelihood is no longer flat, but it moves by roughly 10 to 55 units over $q \in [0, 0.4]$, against about 100 to 125 with the real dwell times.
+- **Side result for the main model (not about identification).** The likelihood prefers dwell times that are about halfway between the box-level and the option-level values: the best blend is $a \approx 0.5$, about 110 units better than the real dwell times in each condition, and the fitted $q$ moves from about 0.22 (real dwell) to about 0.15 (blend). Putting the reference inside the aversive range, near the bottom of the span, does not depend on this, but the exact position does. The main model is unchanged.
+- The interpretation for the paper's Discussion (not for the Results) is in the chat summary of this session, not here.

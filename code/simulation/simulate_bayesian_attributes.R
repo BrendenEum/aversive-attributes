@@ -29,9 +29,12 @@
 # s0 so large that the prior carries no weight in the estimate. The mean still
 # matters under the flat prior: it is where the loss-aversion kink sits.
 #
-# Sampling. t seconds of dwell give a sample mean xbar ~ Normal(z, sigma^2 / t).
-# The box's posterior mean is m = m0 + w * (xbar - m0) with
-#   w = (t / sigma^2) / (1 / prior_sd^2 + t / sigma^2).
+# Sampling. t_ij seconds of dwell on attribute j of option i give a sample mean
+# xbar_ij ~ Normal(z_ij, sigma_x^2 / t_ij). The box's posterior mean is
+# m_ij = m0 + pi(t_ij) * (xbar_ij - m0), where pi(t_ij) is the relative precision
+# of the sampled information (the paper's notation; w in the code below),
+#   pi(t_ij) = (t_ij / sigma_x^2) / (1 / sigma_p^2 + t_ij / sigma_x^2),
+# with sigma_x = sigma and sigma_p = prior_sd in the code.
 #
 # Loss aversion. The posterior mean is valued relative to the prior mean: a box
 # whose estimate falls below m0 counts lambda times its distance,
@@ -43,12 +46,15 @@
 # flat priors it sits at 0.
 # An option's estimate is the sum of its two boxes' u(m); the larger is chosen.
 #
-# Closed form. Given the dwell times each m is normal, so the mean and variance
-# of u(m) have closed forms (partial moments of a normal around the kink), and
-# V_left - V_right, a sum of four such terms, is treated as normal with the
-# summed mean Delta and variance v. P(choose left) = pnorm(Delta / sqrt(v)).
-# The fitting code uses this; simulate_choices_direct() checks it against a
-# box-by-box simulation.
+# Choice probability. Given the dwell times each m is normal, so each box's
+# u(m) is a normal whose lower half is stretched by lambda. With lambda = 1
+# nothing is stretched, V_left - V_right is normal, and P(choose left) =
+# pnorm(Delta / sqrt(v)) with Delta and v its mean and variance (kinked_moments
+# gives both in closed form for any lambda). With lambda != 1 the difference is
+# not normal and that formula is only an approximation, so the probability is
+# computed exactly on a grid of utility values instead (piece_choice_logprob
+# below and code/simulation/exact_choice_prob.cpp). simulate_choices_direct()
+# checks the probabilities against a box-by-box simulation.
 #
 # Parameters, collected in a list `par`: sigma (noise per second; one per
 # subject, passed separately), s0, q and lambda (vectors named "Narrow" and
@@ -142,12 +148,15 @@ by_condition <- function(x, cond_chr) {
 # Mean and variance of a box's posterior mean after `dwell` seconds of looking,
 # given the prior Normal(m0, prior_sd^2) and noise sigma per second (all in z
 # units). A box that was never seen keeps the prior mean, with no variance.
+# sigma is one number, one value per box, or a matrix with one row per box and
+# one column per candidate sigma (the fitting code evaluates every box at a
+# whole grid of sigmas at once); the per-box inputs recycle down the columns.
 bayes_box_moments <- function(z, dwell, m0, prior_sd, sigma) {
-  tau_t <- dwell / sigma^2                     # precision contributed by the samples
-  w     <- tau_t / (1 / prior_sd^2 + tau_t)    # weight on the samples
-  w[dwell <= 0] <- 0
+  seen  <- as.numeric(dwell > 0)
+  tau_t <- dwell / sigma^2                             # precision contributed by the samples
+  w     <- tau_t / (1 / prior_sd^2 + tau_t) * seen     # weight on the samples; 0 for a box never seen
   m_mean <- m0 + w * (z - m0)
-  m_var  <- ifelse(dwell > 0, w^2 * sigma^2 / dwell, 0)
+  m_var  <- w^2 * sigma^2 / ifelse(seen == 1, dwell, 1)   # 0 for a box never seen, since w = 0 there
   list(mean = m_mean, var = m_var)
 }
 
@@ -225,7 +234,8 @@ kinked_moments <- function(m_mean, m_var, m0, lambda) {
 }
 
 # Mean and variance of V_left - V_right for every trial of a piece. sigma is a
-# per-box vector or one number; par has s0, q and lambda (per condition).
+# per-box vector or one number (vectors out), or a boxes x candidates matrix
+# (trials x candidates matrices out); par has s0, q and lambda (per condition).
 piece_moments <- function(piece, variant, sigma, par) {
   b   <- piece$boxes
   m0  <- box_prior_mean(b, by_condition(par$q, b$cond_chr), variant$prior)
@@ -233,16 +243,98 @@ piece_moments <- function(piece, variant, sigma, par) {
   mom <- bayes_box_moments(b$z, b$dwell, m0, psd, sigma)
   lam <- by_condition(par$lambda, b$cond_chr)
   if (any(lam != 1)) mom <- kinked_moments(mom$mean, mom$var, m0, lam)
-  list(
-    delta = as.vector(rowsum(b$side_sign * mom$mean, b$trial_id)),
-    var   = as.vector(rowsum(mom$var, b$trial_id))
-  )
+  delta <- rowsum(b$side_sign * mom$mean, b$trial_id)
+  var   <- rowsum(mom$var, b$trial_id)
+  if (is.matrix(sigma)) list(delta = delta, var = var) else list(delta = as.vector(delta), var = as.vector(var))
 }
 
-# P(choose left) for every trial of a piece.
-piece_choice_prob <- function(piece, variant, sigma, par) {
-  mm <- piece_moments(piece, variant, sigma, par)
-  ifelse(mm$var > 0, pnorm(mm$delta / sqrt(mm$var)), 0.5)
+# ---------------------------------------------------------------------------
+# Choice probabilities
+# ---------------------------------------------------------------------------
+
+# With lambda = 1, V_left - V_right is normal and P(choose left) is the probit
+# pnorm(Delta / sqrt(v)). With lambda != 1 each box's u(m) is a normal whose
+# lower half is stretched, the difference is not normal, and the probit is only
+# an approximation (off by up to 0.006 at the fitted lambda of 1.065, and by up
+# to 0.08 at lambda = 2.5). The probability is then computed exactly, in C++
+# (exact_choice_prob.cpp): every box's utility is laid on a grid of values,
+# each option's utility is the sum of its boxes, and the left option is
+# compared with the right cell by cell. The grid's error shrinks with the
+# square of its spacing, so the calculation is run at spacings h, h/2 and h/4
+# and extrapolated to zero spacing (Richardson extrapolation), which removes
+# the h^2 and h^4 error terms. Checked against the probit at lambda = 1
+# (agreement to 2e-9), against 1e7-draw simulations at lambda = 1.065 and 2.5
+# (agreement within the simulation error, 5e-5), and against a grid eight
+# times finer (relative differences 2e-7 for ordinary probabilities, 1e-5
+# around 1e-8; the full data's log-likelihood moves by ~3e-5 at the fitted
+# parameters, the number the supplement reports).
+#
+# The probit stays exact when no box of the trial can land on its stretched
+# side, i.e. every box is more than KINK_SD SDs from the reference point (a
+# probability below 1e-16 of landing there); those trials keep it, which is
+# cheaper. Boxes that were never seen (kappa = 0) sit exactly at the reference
+# point and add nothing random; the C++ leaves them out of the sum.
+GRID_FACTOR <- 0.5           # grid spacing h = GRID_FACTOR * the trial's smallest box SD (kappa)
+GRID_NSD    <- 7.5           # each box's grid covers this many SDs on either side
+KINK_SD     <- 8.3           # pnorm(-8.3) < 1e-16: beyond this the kink carries no probability
+Rcpp::sourceCpp(here::here("code/simulation/exact_choice_prob.cpp"))
+
+# Extrapolation of the three grid levels (spacings h, h/2, h/4) to zero
+# spacing: the levels' errors are a h^2 + b h^4 + ..., and these weights cancel
+# a and b.
+extrapolate_levels <- function(P) (P[, 1] - 20 * P[, 2] + 64 * P[, 3]) / 45
+
+# Log probabilities of choosing left and of choosing right for every trial of
+# a piece, as list(left, right): trials x candidates matrices when sigma is a
+# boxes x candidates matrix, vectors when sigma is a per-box vector or one
+# number. par has s0, q and lambda (per condition). Both sides are computed
+# directly (the right one is not 1 minus the left), so a small probability
+# keeps its relative accuracy and its log is sound. exact = FALSE returns the
+# probit for any lambda, only for showing the size of the approximation.
+piece_choice_logprob <- function(piece, variant, sigma, par, exact = TRUE) {
+  b   <- piece$boxes
+  vec <- !is.matrix(sigma)
+  if (vec) sigma <- matrix(sigma, nrow(b), 1)
+  m0  <- box_prior_mean(b, by_condition(par$q, b$cond_chr), variant$prior)
+  psd <- box_prior_sd(b, by_condition(par$s0, b$cond_chr), variant$prior)
+  lam <- by_condition(par$lambda, b$cond_chr)
+  mom <- bayes_box_moments(b$z, b$dwell, m0, psd, sigma)       # boxes x candidates
+  kinked <- any(lam != 1)
+  km    <- if (kinked) kinked_moments(mom$mean, mom$var, m0, lam) else mom
+  delta <- rowsum(b$side_sign * km$mean, b$trial_id)            # trials x candidates
+  v     <- rowsum(km$var, b$trial_id)
+  z     <- ifelse(v > 0, delta / sqrt(v), 0)
+  left  <- pnorm(z, log.p = TRUE)       # the log of the normal CDF directly, so confident trials don't underflow
+  right <- pnorm(-z, log.p = TRUE)
+  if (kinked && exact) {
+    nt <- nrow(delta)
+    stopifnot(nrow(b) == 4 * nt, all(tabulate(b$trial_id, nt) == 4))
+    eta_b <- mom$mean - m0                                       # each box's estimate relative to the reference point: mean
+    kap_b <- sqrt(mom$var)                                       # and SD
+    # Trials x candidates where some box can land on its stretched side (and
+    # lambda != 1): the probit is an approximation there and the grid takes over.
+    near  <- kap_b > 0 & abs(eta_b) <= KINK_SD * kap_b
+    lam_t <- lam[match(seq_len(nt), b$trial_id)]                 # each trial's lambda (its boxes share it)
+    need  <- which(rowsum(near + 0, b$trial_id) > 0 & lam_t != 1)   # trials x candidates (near + 0 keeps the matrix)
+    if (length(need) > 0) {
+      rows <- matrix(order(b$trial_id), nrow = 4)                # column t: the four boxes of trial t
+      col4 <- function(x) matrix(sapply(1:4, function(p) as.vector(x[rows[p, ], , drop = FALSE])), ncol = 4)
+      ng   <- ncol(sigma)
+      P <- exact_choice_prob(col4(eta_b)[need, , drop = FALSE], col4(kap_b)[need, , drop = FALSE],
+                             col4(matrix(b$side_sign, nrow(b), ng))[need, , drop = FALSE],
+                             col4(matrix(lam, nrow(b), ng))[need, , drop = FALSE],
+                             GRID_FACTOR, 3L, GRID_NSD)
+      left[need]  <- log(pmax(extrapolate_levels(P[, 1:3, drop = FALSE]), 0))
+      right[need] <- log(pmax(extrapolate_levels(P[, 4:6, drop = FALSE]), 0))
+    }
+  }
+  if (vec) list(left = as.vector(left), right = as.vector(right)) else list(left = left, right = right)
+}
+
+# P(choose left) for every trial of a piece (a trials x candidates matrix when
+# sigma is a matrix, a vector otherwise).
+piece_choice_prob <- function(piece, variant, sigma, par, exact = TRUE) {
+  exp(piece_choice_logprob(piece, variant, sigma, par, exact)$left)
 }
 
 # ---------------------------------------------------------------------------

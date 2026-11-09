@@ -1,17 +1,20 @@
 # Parameter-recovery figure for the Bayesian attribute-level model: recovered
-# against true values of the per-subject noise sigma (one point per subject
-# and dataset, by study), the prior position q (one point per range condition
-# and dataset) and the loss aversion lambda (shared by both range conditions,
-# so one point per dataset, "Pooled"). The q and lambda panels are both titled
-# "Pooled", centred like the Study 1 / Study 2 strips over the sigma facets.
-# Every panel has linear axes with the
-# same range and ticks on x and y, and a dashed identity line drawn over the
-# points. One legend (Narrow, Wide, Pooled) sits at the right of the figure.
-# Used by code/parameter_recovery/recover_bayesian_attributes.R, which saves
-# it to paper/figures/parameter_recovery_bayesian.pdf, and shown in
+# against true values of, from top to bottom, the prior position q (one point
+# per range condition and dataset) and the loss aversion lambda (shared by both
+# range conditions, so one point per dataset, "Pooled"); the population mean mu
+# and SD tau of log sigma (one point per range condition and dataset); and the
+# per-subject noise sigma (posterior mean against the true draw; one point per
+# subject and dataset, by study). The group panels are all titled "Pooled",
+# centred like the Study 1 / Study 2 strips over the sigma facets. Every panel
+# has linear axes with the same range and ticks on x and y, and a dashed
+# identity line drawn over the points. One legend (Narrow, Wide, Pooled) sits
+# at the right of the figure. Used by
+# code/parameter_recovery/recover_bayesian_attributes.R, which saves it to
+# paper/figures/parameter_recovery_bayesian.pdf, and shown in
 # notebooks/bayesian_model.Rmd.
 #   sig_df  columns dataset, Study, Subject, WN, true, recovered
-#   grp_df  columns dataset, WN, true_q, rec_q, true_lambda, rec_lambda
+#   grp_df  columns dataset, WN, true_q, rec_q, true_lambda, rec_lambda,
+#           true_mu, rec_mu, true_tau, rec_tau
 # Needs ggplot2 and patchwork attached, and the options in MyPlotOptions.R.
 plot_parameter_recovery <- function(sig_df, grp_df) {
   # One key for all three panels: the range condition of a point, or "Pooled"
@@ -39,23 +42,35 @@ plot_parameter_recovery <- function(sig_df, grp_df) {
     scale_x_continuous(breaks = seq(0, 40, 10)) +
     scale_y_continuous(breaks = seq(0, 40, 10)) +
     key_scales +
-    labs(x = expression("True " * sigma), y = expression("Recovered " * sigma)) +
+    labs(x = expression("True " * sigma[x]), y = expression("Recovered " * sigma[x])) +
     .myPlot +
     coord_cartesian(xlim = c(0, 40), ylim = c(0, 40)) +
     theme(strip.background = element_blank(), strip.text = element_text(size = .title_pt * .fontscale)) +
     guides(color = "none", shape = "none")
 
+  # A group parameter with one point per range condition and dataset (q, mu,
+  # tau). Only the q panel carries the legend (show.legend = TRUE draws a key
+  # for "Pooled" too, which these panels have no points for).
+  cond_panel <- function(true, rec, xlab, ylab, legend = FALSE) {
+    lims <- range(c(true, rec))
+    p <- ggplot(data.frame(true = true, rec = rec, WN = grp_df$WN), aes(x = true, y = rec, color = WN, shape = WN)) +
+      geom_point(size = 6, show.legend = legend) +
+      identity_line(alpha = 0.75) +
+      scale_x_continuous(limits = lims) +
+      scale_y_continuous(limits = lims) +
+      key_scales +
+      labs(title = "Pooled", x = xlab, y = ylab) +
+      .myPlot +
+      theme(plot.title = element_text(hjust = 0.5))
+    if (legend) p + theme(legend.position = "right") else p + guides(color = "none", shape = "none")
+  }
+
   # Prior position, one point per range condition and dataset.
-  lims_q <- range(c(grp_df$true_q, grp_df$rec_q))
-  p_q <- ggplot(grp_df, aes(x = true_q, y = rec_q, color = WN, shape = WN)) +
-    geom_point(size = 6, show.legend = TRUE) +   # TRUE draws a key for "Pooled" too, which this panel has no points for
-    identity_line(alpha = 0.75) +
-    scale_x_continuous(limits = lims_q) +
-    scale_y_continuous(limits = lims_q) +
-    key_scales +
-    labs(title = "Pooled", x = "True q", y = "Recovered q") +
-    .myPlot +
-    theme(legend.position = "right", plot.title = element_text(hjust = 0.5))
+  p_q <- cond_panel(grp_df$true_q, grp_df$rec_q, "True q", "Recovered q", legend = TRUE)
+
+  # Population mean and SD of log sigma, one point per range condition and dataset.
+  p_mu  <- cond_panel(grp_df$true_mu,  grp_df$rec_mu,  expression("True " * mu),  expression("Recovered " * mu))
+  p_tau <- cond_panel(grp_df$true_tau, grp_df$rec_tau, expression("True " * tau), expression("Recovered " * tau))
 
   # Loss aversion, shared by both conditions: one point per dataset.
   lam_df <- grp_df[grp_df$WN == "Narrow", ]
@@ -71,5 +86,5 @@ plot_parameter_recovery <- function(sig_df, grp_df) {
     theme(plot.title = element_text(hjust = 0.5)) +
     guides(color = "none", shape = "none")
 
-  (p_sigma / (p_q | p_lambda)) + plot_layout(guides = "collect")
+  ((p_q | p_lambda) / (p_mu | p_tau) / p_sigma) + plot_layout(guides = "collect")
 }

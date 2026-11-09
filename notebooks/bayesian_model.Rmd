@@ -23,10 +23,11 @@ when porting; the data cleaning itself already lives in
 `code/utilities/build_boxlong.R`, which the main notebook can switch to). Everything
 model-specific lives in scripts under `code/`:
 
-- `code/simulation/simulate_bayesian_attributes.R`: the model and its closed-form choice probabilities
-- `code/fitting/fit_bayesian_attributes.R`: maximum-likelihood fitting, leave-one-out, the list of variants
-- `code/fitting/run_bayesian_fits.R`: fits every variant and runs the leave-one-out from a terminal (every fold is a full refit, so hours; see the script header), caching to `results/cache/bayesian_model/`
-- `code/parameter_recovery/recover_bayesian_attributes.R`: parameter recovery for the main model, from a terminal (~1.5 hours)
+- `code/simulation/simulate_bayesian_attributes.R`: the model and its choice probabilities (exact, computed on a grid of utility values by `code/simulation/exact_choice_prob.cpp`, C++ via Rcpp)
+- `code/fitting/fit_bayesian_attributes.R`: maximum-likelihood fitting, cross-validation, the list of variants
+- `code/fitting/run_bayesian_fits.R`: fits every variant and runs the cross-validation from a terminal (every fold is a full refit of about an hour; see the script header), caching to `results/cache/bayesian_model/`
+- `code/parameter_recovery/recover_bayesian_attributes.R`: parameter recovery for the main model, from a terminal (one to five hours per dataset, longer the larger the true $\lambda$; the datasets can be split over processes)
+- `code/fitting/run_all_bayesian_fits.sh`: runs all of the above as a queue of jobs, seven at a time (13 hours on an 8-core laptop)
 
 This notebook loads those caches. With `RUN_FITS <- TRUE` it fits any variant
 whose cache is missing (slow); with `FALSE` it skips it.
@@ -37,9 +38,10 @@ Sections:
 2. Model
 3. Sanity checks
 4. Parameter recovery
-5. Fits and leave-one-out
+5. Fits and cross-validation
 6. Out-of-sample attention weights: main and supplementary figures, tables
-7. Notes
+7. Sampling noise by range condition (bootstrap over participants)
+8. Notes
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(
@@ -70,7 +72,7 @@ source(here::here("code/utilities/getAllUtilities.R"))
 
 ```{r options}
 # Fit a variant inside the notebook when its cache is missing? Every fold of
-# the leave-one-out is a full refit, so a variant takes hours;
+# the cross-validation is a full refit, so a variant takes hours;
 # code/fitting/run_bayesian_fits.R does the same from a terminal. With FALSE,
 # variants without a cache are skipped.
 RUN_FITS <- TRUE
@@ -152,6 +154,35 @@ build_flex_dat <- function(range, bl, ps) {
     left_join(value_design, by = c("Subject", "TrialKey")) %>%
     left_join(flex_design,  by = c("Subject", "TrialKey"))
 }
+
+# The main text's specification (the main notebook's build_flex_dat): one row
+# per trial with ChooseL, S2 (1 for Study 2), the signed presence U_<cell> of
+# every cell except each type's lowest value, which is the reference (+1 in
+# the left option, -1 in the right, 0 off screen), and the signed dwell in
+# every cell. Pooled over the studies.
+build_utility_dat <- function(range, bl, ps) {
+  bl <- bl %>% filter(WN == range)
+  ps <- ps %>% filter(WN == range)
+
+  dwell_design <- bl %>%
+    group_by(Subject, TrialKey, cell) %>%
+    summarise(sd = sum(signed_dwell), .groups = "drop") %>%
+    pivot_wider(names_from = cell, values_from = sd, values_fill = 0)
+
+  util_design <- bl %>%
+    group_by(Subject, TrialKey, cell) %>%
+    summarise(sp = sum(side_sign), .groups = "drop") %>%
+    pivot_wider(names_from = cell, values_from = sp, values_fill = 0, names_prefix = "U_")
+  ref_cells   <- bl %>% distinct(type, value, cell) %>% group_by(type) %>% slice_min(value, n = 1) %>% pull(cell)
+  util_design <- util_design %>% select(-all_of(paste0("U_", ref_cells)))
+
+  ps %>%
+    transmute(Subject, TrialKey, ChooseL, S2 = as.integer(Study == 2)) %>%
+    left_join(util_design,  by = c("Subject", "TrialKey")) %>%
+    left_join(dwell_design, by = c("Subject", "TrialKey"))
+}
+util_cols  <- function(dat) str_subset(names(dat), "^U_")
+dwell_cols <- function(dat) str_subset(names(dat), "^[PNB]_(neg|pos)[0-9]+$")
 ```
 
 ```{r plot-weights}
@@ -170,32 +201,52 @@ plot_weights_by_range <- function(weights, title, ylim = c(-0.5, 0.5)) {
   if (!is.null(ylim)) p <- p + coord_cartesian(ylim = ylim)
   p
 }
+
+# Data (points with 95% intervals, no connecting lines) and one model (lines,
+# no points) in the same panels, Narrow and Wide overlaid: geometry tells data
+# from model, color tells the range condition. The model's own 95% HDIs are
+# not drawn.
+plot_overlay <- function(data_w, model_w, title, ylim = c(-0.5, 0.5)) {
+  p <- ggplot(mapping = aes(x = value, color = WN)) +
+    facet_wrap(~ type, scales = "free_x", labeller = type_labels) +
+    geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
+    geom_line(data = model_w, aes(y = estimate, group = WN), linewidth = .linewidth, position = wn_dodge) +
+    geom_pointrange(data = data_w, aes(y = estimate, ymin = lo, ymax = hi, shape = WN),
+                    size = pt_size, linewidth = .linewidth, position = wn_dodge) +
+    wn_scales +
+    labs(x = "Attribute Value", y = "Attention Weight", title = title) +
+    .myPlot + type_strip_style + study_title + legend_right + theme(legend.direction = "vertical") +
+    scale_x_continuous(breaks = x_attr_breaks)
+  if (!is.null(ylim)) p <- p + coord_cartesian(ylim = ylim)
+  p
+}
 ```
 
 ```{r data-weights}
-# The data's cell weights: posterior medians and 95% HDIs from the two cached
-# brms fits (the main notebook's flex-summary chunk). Each fit is ~900 MB, so
-# the summary is cached after the first extraction.
-data_weights_file <- file.path(cache_dir, "data_cell_weights.rds")
+# The data's cell weights under the main text's specification: posterior
+# medians and 95% HDIs from the main notebook's two cached brms fits
+# (utilities and cell weights, pooled over the studies). Each fit is ~1.4 GB,
+# so the summary is cached after the first extraction. These are the numbers
+# the paper quotes, and the data points of the figures and the data side of
+# the fits table's error column. `se` is the posterior SD (for the error
+# column's noise floor). The data's plain-regression weights
+# (weights_data_glm, in the oos-weights chunk) are kept for comparison.
+data_weights_file <- file.path(cache_dir, "data_cell_weights_utility.rds")
 if (file.exists(data_weights_file)) {
   weights_data <- readRDS(data_weights_file)
 } else {
   weights_data <- tibble()
   for (rng in c("Narrow", "Wide")) {
-    f <- file.path(fit_dir, paste0("flex_attention_weights_pooled_", tolower(rng), ".rds"))
+    f <- file.path(fit_dir, paste0("attention_weights_utility_", tolower(rng), ".rds"))
     if (!file.exists(f)) { cat("No cached fit", f, "\n"); next }
     draws <- as_draws_df(readRDS(f), variable = "^b_", regex = TRUE)
     cells <- names(draws) %>% str_subset("^b_[PNB]_(neg|pos)[0-9]+$") %>% str_remove("^b_")
-    for (s in 1:2) {
-      for (cell in cells) {
-        # Study 1 is the reference level; Study 2 adds the cell's Study 2 interaction.
-        x <- draws[[paste0("b_", cell)]]
-        if (s == 2) x <- x + draws[[paste0("b_", cell, ":Study2")]]
-        h <- bayestestR::hdi(x, ci = 0.95)
-        weights_data <- bind_rows(weights_data, tibble(
-          Study = s, WN = rng, term = cell, estimate = median(x), lo = h$CI_low, hi = h$CI_high
-        ))
-      }
+    for (cell in cells) {
+      x <- draws[[paste0("b_", cell)]]
+      h <- bayestestR::hdi(x, ci = 0.95)
+      weights_data <- bind_rows(weights_data, tibble(
+        WN = rng, term = cell, estimate = median(x), se = sd(x), lo = h$CI_low, hi = h$CI_high
+      ))
     }
     rm(draws); invisible(gc())
   }
@@ -234,20 +285,21 @@ matter for how the attribute types are weighted within a condition; an earlier
 round of fits showed that weighting per point beats weighting by each type's
 spread, which is why only points are kept.
 
-**Prior.** $\mathcal{N}(m_0, s_p^2)$: $m_0$ sits a fraction $q$ of the way from
+**Prior.** $\mathcal{N}(m_0, \sigma_p^2)$: $m_0$ sits a fraction $q$ of the way from
 the reference's minimum to its maximum ($q = 0.5$ is the middle), and
-$s_p = s_D$, the spread of the reference. (An earlier round fitted the ratio
-$s_p / s_D$ freely and found 1.07 and 1.17, so it is now fixed at 1.) The zero
+$\sigma_p = s_D$, the spread of the reference. (An earlier round fitted the ratio
+$\sigma_p / s_D$ freely and found 1.07 and 1.17, so it is now fixed at 1.) The zero
 prior fixes $m_0$ at an objective 0, which for the symmetric spans of this
-design is $q = 0.5$; the flat prior keeps that mean and sets $s_p$ to 1000
+design is $q = 0.5$; the flat prior keeps that mean and sets $\sigma_p$ to 1000
 $s_D$, so the prior carries no weight in the estimate, but its mean still
 serves as the reference of the loss-aversion kink below.
 
-**Sampling and loss aversion.** For a box with value $a$ after $t$ seconds of dwell,
+**Sampling and loss aversion.** For attribute $j$ of option $i$, with value $a_{ij}$ after $t_{ij}$ seconds of dwell,
+the relative precision of the sampled information is $\pi(t_{ij})$ and the estimate is $m_{ij}$:
 
 $$
-w = \frac{t / \sigma^2}{1 / s_p^2 + t / \sigma^2}, \qquad
-m = m_0 + w\,(\bar{x} - m_0), \quad \bar{x} \sim \mathcal{N}(a, \sigma^2 / t),
+\pi(t_{ij}) = \frac{t_{ij} / \sigma_x^2}{1 / \sigma_p^2 + t_{ij} / \sigma_x^2}, \qquad
+m_{ij} = m_0 + \pi(t_{ij})\,(\bar{x}_{ij} - m_0), \quad \bar{x}_{ij} \sim \mathcal{N}(a_{ij}, \sigma_x^2 / t_{ij}),
 $$
 
 and the box is valued relative to the prior mean with a kink,
@@ -255,23 +307,49 @@ $u(m) = m_0 + (m - m_0)$ if $m \ge m_0$ and $u(m) = m_0 + \lambda (m - m_0)$ if
 $m < m_0$. With $\lambda > 1$ attention repels more strongly from a box whose
 estimate sits below the reference than it attracts toward one above it;
 $\lambda = 1$ is the plain model. An option's estimate is the sum of its two
-boxes' $u(m)$; the larger one is chosen. Given the dwell times each $m$ is
-normal, the mean and variance of $u(m)$ have closed forms (partial moments of a
-normal around the kink), and $V_L - V_R$ is treated as normal with the summed
-mean and variance, so the probability of choosing left is a probit. The sanity
-checks compare this closed form with a box-by-box simulation. Trials with a box
-that was never hovered (NA dwell) are dropped, as the paper's regressions drop them.
+boxes' $u(m)$; the larger one is chosen. We do not see the samples a
+participant drew, only how long they looked, so a choice has a probability:
+the chance, over the samples they might have drawn, that the left option's
+estimate comes out higher. Given the dwell times each $m$ is normal, so each
+box's $u(m)$ is a normal whose lower half is stretched by $\lambda$. With
+$\lambda = 1$ nothing is stretched, $V_L - V_R$ is normal, and the probability
+is the probit $\Phi(\Delta / \sqrt{v})$ with $\Delta$ and $v$ its mean and
+variance, which have closed forms. With $\lambda \ne 1$ the difference is not
+normal and that probit is only an approximation (off by up to 0.006 per trial
+at the fitted $\lambda$, about 1.6 log-likelihood units in all, and by far more
+at $\lambda = 2.5$), so the probability is computed exactly instead: every
+box's utility is laid on a grid of values, each option's utility is the sum of
+its boxes, and the left option is compared with the right cell by cell. The
+grid's error shrinks with the square of its spacing, so the calculation is run
+at spacings $h$, $h/2$ and $h/4$ ($h$ = half the trial's smallest box SD) and
+extrapolated to zero spacing, which removes the leading error terms. The
+probit is kept where it is exact: $\lambda = 1$ (stages 1 and 2 of the fit), and
+trials in which every box is more than 8.3 SDs from the reference point, so
+that no box can land on its stretched side. The sanity checks compare the exact
+probabilities with a box-by-box simulation and with the probit. Trials with a
+box that was never hovered (NA dwell) are dropped, as the paper's regressions
+drop them.
 
-**Parameters and error model.** $\sigma$ (noise per second, one per subject);
-$q$ per range condition; $\lambda$ shared by both conditions (the
-`cond_lamcond` variant fits it per condition as a check). All group parameters
-are pooled across subjects. One algorithm fits every variant, and the variants
-differ only in which group parameters are free: the zero and flat priors fix
-$q$ at 0.5 and fit $\sigma$ and $\lambda$ like the others. The subjects' log
-noise values are partially pooled, with a Gaussian pull toward the group median
-(SD of one log unit), the same logic as a subject random effect; it only bites
-for subjects whose 30 or 60 trials leave $\sigma$ poorly determined, and it
-keeps a held-out error from ever costing more than a few log-likelihood units.
+**Parameters and error model.** $\sigma$ (noise per second) is a random
+effect: in each range condition $\log \sigma$ is normal with mean $\mu$ and SD
+$\tau$, both fitted, and a subject's likelihood is the probability of their
+choices averaged over that distribution (the marginal likelihood, as in a
+mixed-effects regression). The average is a sum over a grid of 60 values of
+$\log \sigma$ from 0.005 to 500 points per second with weights proportional to
+the normal density, so the population is a normal truncated to that range; a
+finer grid changes nothing to four decimals. $q$ per range condition;
+$\lambda$ shared by both conditions (the `cond_lamcond` variant fits it per
+condition as a check). All group parameters are pooled across subjects. One
+algorithm fits every variant, and the variants differ only in which group
+parameters are free: the zero and flat priors fix $q$ at 0.5 and fit the
+population and $\lambda$ like the others. Averaging over $\sigma$ replaces an
+earlier penalised fit of one $\sigma$ per subject (a hand-set pull of
+$\log \sigma$ toward the group median): plain maximum likelihood sends the
+$\sigma$ of a subject with 30 correct trials to zero, and a held-out error
+then costs 25+ log-likelihood units; here, how far a subject's own trials
+pull them away from the population is set by $\tau$, which the data choose.
+For reporting, a subject's $\sigma$ is their posterior mean, and predictions
+average the choice probability over that posterior.
 
 **Variants.** `cond_lam` (per-condition prior, loss aversion), `cond_lam1`
 (same, $\lambda = 1$), `type_lam` and `type_lam1` (per-type prior with and
@@ -333,6 +411,30 @@ simulated_weights <- function(trials, reps = 10, seed = 1) {
   cell_weight_glm(bl_sim, sims)
 }
 
+# The main text's specification (utilities and cell weights, pooled over the
+# studies) as one plain logistic regression per range condition: the data's
+# comparison rows. Returns the cell weights with Wald 95% CIs, parsed into
+# type and value.
+utility_weight_glm <- function(bl, ps) {
+  weights <- tibble()
+  for (rng in c("Narrow", "Wide")) {
+    dat <- build_utility_dat(rng, bl, ps)
+    f   <- as.formula(paste("ChooseL ~ 1 + S2 +", paste(util_cols(dat), collapse = " + "), "+",
+                            paste(dwell_cols(dat), collapse = " + ")))
+    fit <- glm(f, family = binomial, data = dat)
+    co  <- summary(fit)$coefficients
+    weights <- bind_rows(weights, tibble(WN = rng, term = rownames(co), estimate = co[, 1], se = co[, 2]) %>%
+                           filter(term %in% dwell_cols(dat)))
+  }
+  weights %>% mutate(
+    lo    = estimate - 1.96 * se,
+    hi    = estimate + 1.96 * se,
+    type  = factor(str_sub(term, 1, 1), levels = c("N", "B", "P")),
+    value = as.numeric(str_extract(term, "[0-9]+$")) * if_else(str_detect(term, "_neg"), -1, 1),
+    WN    = factor(WN, levels = c("Narrow", "Wide"))
+  )
+}
+
 # Where a type's attention weights cross zero, as a fraction of the way from
 # the type's minimum to its maximum value (linear interpolation between the
 # first adjacent pair that goes from negative to positive). "all+" / "all-"
@@ -353,10 +455,10 @@ crossover <- function(values, weights) {
 # Crossover of every (Study, range, type) in a weights table.
 crossover_table <- function(weights, source) {
   out <- tibble()
-  for (s in 1:2) for (rng in c("Narrow", "Wide")) for (tt in c("N", "B", "P")) {
-    w <- weights %>% filter(Study == s, WN == rng, type == tt)
+  for (rng in c("Narrow", "Wide")) for (tt in c("N", "B", "P")) {
+    w <- weights %>% filter(WN == rng, type == tt)
     if (nrow(w) == 0) next
-    out <- bind_rows(out, tibble(source = source, Study = s, WN = rng, type = tt, crossover = crossover(w$value, w$estimate)))
+    out <- bind_rows(out, tibble(source = source, WN = rng, type = tt, crossover = crossover(w$value, w$estimate)))
   }
   out
 }
@@ -366,9 +468,11 @@ crossover_table <- function(weights, source) {
 
 # Sanity checks
 
-The reference distributions, and three checks of the code: the closed-form
-choice probabilities against a box-by-box simulation, with and without loss
-aversion; a model with almost no noise chooses the better option almost always;
+The reference distributions, and three checks of the code: the exact choice
+probabilities against a box-by-box simulation and against the probit they
+replace, with and without loss aversion (with $\lambda = 1$ all three must
+agree; with $\lambda = 2.5$ the probit is visibly off while the exact values
+track the simulation); a model with almost no noise chooses the better option almost always;
 and the sign patterns the variants produce when run through the cell-weight
 regression, including a hand-set loss-averse version that shows what a
 $\lambda$ of 2.5 does to the bottom of the N range.
@@ -392,7 +496,7 @@ as.data.frame(reference_distributions(boxlong, "type"))
 as.data.frame(reference_distributions(boxlong, "cond"))
 ```
 
-```{r sanity-closed-form}
+```{r sanity-choice-prob}
 prep_cond <- prepare_boxes(boxlong, variants$cond_lam)
 sig_five  <- setNames(rep(5, nrow(prep_cond$subjects)), prep_cond$subjects$Subject)   # 5 points per second
 par_plain <- list(s0 = c(Narrow = 1, Wide = 1), q = c(Narrow = 0.14, Wide = 0.14), lambda = c(Narrow = 1, Wide = 1))
@@ -400,13 +504,15 @@ par_loss  <- list(s0 = c(Narrow = 1, Wide = 1), q = c(Narrow = 0.14, Wide = 0.14
 
 for (nm in c("lambda = 1", "lambda = 2.5")) {
   par <- if (nm == "lambda = 1") par_plain else par_loss
-  pr  <- choice_probabilities(prep_cond, sig_five, par)
+  pr  <- choice_probabilities(prep_cond, sig_five, par)                                 # exact
+  pp  <- piece_choice_prob(prep_cond$all, variants$cond_lam, sig_five[as.character(prep_cond$all$boxes$Subject)], par, exact = FALSE)   # the probit
   sim_mean <- rep(0, nrow(pr))
   for (i in 1:40) sim_mean <- sim_mean + simulate_choices_direct(prep_cond, sig_five, par, seed = i)$ChooseL_sim
   sim_mean <- sim_mean / 40
   bins <- cut(pr$p_left, seq(0, 1, 0.1), include.lowest = TRUE)
-  cat("\n==", nm, "== closed form vs box-by-box simulation, by decile of predicted probability\n")
-  print(round(rbind(closed_form = tapply(pr$p_left, bins, mean), simulated = tapply(sim_mean, bins, mean)), 3))
+  cat("\n==", nm, "== exact vs box-by-box simulation vs probit, by decile of the exact probability\n")
+  print(round(rbind(exact = tapply(pr$p_left, bins, mean), simulated = tapply(sim_mean, bins, mean), probit = tapply(pp, bins, mean)), 3))
+  cat(sprintf("largest |probit - exact| on a trial: %.4f\n", max(abs(pp - pr$p_left))))
 }
 
 # Almost no noise: accuracy on trials with unequal option values should be ~1.
@@ -446,11 +552,13 @@ for (nm in names(sanity)) {
 # Parameter recovery
 
 Run by `code/parameter_recovery/recover_bayesian_attributes.R` (20 simulated
-datasets on the real trial structure, true $q$, shared $\lambda$ and
-per-subject noise drawn at random, refit from scratch with the same procedure).
-The notebook only shows the cached results.
+datasets on the real trial structure; true $q$, shared $\lambda$ and the
+population $\mu$ and $\tau$ per range condition drawn at random, each subject's
+noise drawn from that population, refit from scratch with the same procedure;
+a subject's recovered $\sigma$ is their posterior mean). The notebook only
+shows the cached results.
 
-```{r recovery, fig.width=2 * .figw, fig.height=2 * .figh}
+```{r recovery, fig.width=2 * .figw, fig.height=3 * .figh}
 recovery_file <- file.path(cache_dir, "parameter_recovery.rds")
 if (!file.exists(recovery_file)) {
   cat("No parameter-recovery cache. Run: Rscript code/parameter_recovery/recover_bayesian_attributes.R\n")
@@ -469,6 +577,10 @@ if (!file.exists(recovery_file)) {
   lam_df <- grp_df %>% filter(WN == "Narrow")   # lambda is shared: one point per dataset
   cat(sprintf("lambda: r(log) = %.3f, median |log(recovered / true)| = %.3f\n",
               cor(log(lam_df$true_lambda), log(lam_df$rec_lambda)), median(abs(log(lam_df$rec_lambda / lam_df$true_lambda)))))
+  cat(sprintf("mu:  r = %.3f, median |recovered - true| = %.3f\n",
+              cor(grp_df$true_mu, grp_df$rec_mu), median(abs(grp_df$rec_mu - grp_df$true_mu))))
+  cat(sprintf("tau: r = %.3f, median |recovered - true| = %.3f\n",
+              cor(grp_df$true_tau, grp_df$rec_tau), median(abs(grp_df$rec_tau - grp_df$true_tau))))
 
   # The paper's figure, drawn by code/utilities/plot_parameter_recovery.R and
   # saved to paper/figures by the recovery script.
@@ -478,18 +590,24 @@ if (!file.exists(recovery_file)) {
 
 ---
 
-# Fits and leave-one-out
+# Fits and cross-validation
 
-Every variant is fit to all trials on the profile likelihood (noise per
-subject re-optimised on a grid of $q$, then $q$ per range condition and
-$\lambda$ refined, jointly over both conditions when $\lambda$ is shared), then
-refit 60 times leaving out the $k$-th trial of every subject and predicting it.
-Every fold is fit from scratch by the same three stages on the training trials,
-with the shrinkage centre recomputed from them, so nothing from the full fit
-enters a fold. The zero and flat priors go through the same stages with $q$
-fixed at 0.5: a single noise pass, nothing to refine per condition, and a
-bounded one-dimensional search over $\lambda$ with the noise re-optimised at
-every candidate. The caches come from `code/fitting/run_bayesian_fits.R`.
+Every variant is fit to all trials on the profile likelihood (at every
+candidate $q$ and $\lambda$, each condition's population of $\sigma$ is refit
+by its own Nelder-Mead on the subjects' grid log-likelihoods; a grid of $q$,
+then $q$ per range condition and $\lambda$ refined, jointly over both
+conditions when $\lambda$ is shared), then refit 12 times, fold $k$ leaving
+out the $k$-th block of five trial positions of every subject (trials numbered
+in order within subject; a subject whose count is not a multiple of five has a
+shorter last block, folds 7 to 12 hold out trials of the 60-trial subjects
+only, and every trial is held out exactly once) and predicting the held-out
+trials from each subject's posterior over $\sigma$ given their training
+trials. Every fold is fit from scratch by
+the same three stages on the training trials, population included, so nothing
+from the full fit enters a fold. The zero and flat priors go through the same
+stages with $q$ fixed at 0.5: a single pass, nothing to refine per condition,
+and a bounded one-dimensional search over $\lambda$ with the population refit
+at every candidate. The caches come from `code/fitting/run_bayesian_fits.R`.
 
 ```{r fits}
 runs <- list()
@@ -505,8 +623,10 @@ names(runs)
 Convergence: Nelder-Mead stops when the relative spread of the objective over
 the simplex falls below $10^{-7}$ (code 0) or at the cap on function
 evaluations (code 1). The full fit's code(s) and the number of folds with a
-nonzero code, per variant; the variants with no Nelder-Mead call (only
-one-dimensional bounded searches) show "none".
+nonzero code, per variant; the variants with no outer Nelder-Mead call (only
+one-dimensional bounded searches) show "none". The inner columns are the same
+for the population steps (relative tolerance $10^{-10}$, cap 500), the worst
+code over every population step of the fit or fold.
 
 ```{r convergence}
 conv <- tibble()
@@ -516,8 +636,10 @@ for (name in names(runs)) {
   conv <- bind_rows(conv, tibble(
     variant = name,
     full_fit = if (length(f$convergence) > 0) paste(f$convergence, collapse = " ") else "none",
+    full_fit_inner = f$convergence_inner,
     folds = n_distinct(fp$fold),
-    folds_not_converged = n_distinct(fp$fold[fp$convergence != 0])
+    folds_not_converged = n_distinct(fp$fold[fp$convergence != 0]),
+    folds_inner_not_converged = n_distinct(fp$fold[fp$convergence_inner != 0])
   ))
 }
 as.data.frame(conv)
@@ -526,13 +648,16 @@ as.data.frame(conv)
 ## Parameters
 
 ```{r params}
+# One row per variant and range condition: the group parameters, the
+# population of sigma (exp(mu) is the population median of sigma in points per
+# second, tau the SD of log sigma) and the marginal NLL.
 params <- tibble()
 for (name in names(runs)) {
   f <- runs[[name]]$fit
   params <- bind_rows(params, tibble(
     variant = name, label = variants[[name]]$label, range = names(f$s0),
     s0 = unname(f$s0), q = unname(f$q[names(f$s0)]), lambda = unname(f$lambda[names(f$s0)]),
-    nll = f$nll, sigma_median = median(f$sigma), sigma_iqr_lo = quantile(f$sigma, 0.25), sigma_iqr_hi = quantile(f$sigma, 0.75)
+    sigma_pop = unname(exp(f$mu[names(f$s0)])), tau = unname(f$tau[names(f$s0)]), nll = f$nll
   ))
 }
 # The reference in points: the prior reference's minimum plus q times its range.
@@ -585,26 +710,100 @@ loo_table %>% mutate(across(where(is.numeric), \(x) round(x, 4))) %>% as.data.fr
 
 # Out-of-sample attention weights
 
-For every plotted variant, ten simulated choices per trial are drawn from the
-held-out probabilities and pushed through the cell-weight regression (plain
-logistic regression per range condition and study). The data's weights come
-from the paper's brms fits; the data's value slopes in the table below come from
-the same plain regression as the models, so like is compared with like.
+For every variant in the paper, ten replicates of one simulated choice per
+trial are drawn from the held-out probabilities (seed 1; the notebook's usual
+ten draws) and each replicate is pushed through the main text's
+attention-weight regression (utilities and cell weights, pooled over the
+studies) with the same brms model, priors and sampler as the data. A
+replicate is fit as its own dataset, the size of the data, so the
+hierarchical model sees the data's design rather than ten copies of every
+trial. Those 100 fits (five variants x two range conditions x ten replicates,
+1.5-3 hours each on 8 cores) ran on Compute Canada through
+`code/fitting/compute_canada_attention_weights.R`, which prepares the
+simulated choices from this notebook's caches, fits them, and collects the
+results. Only a compact summary of each fit comes back
+(`notebooks/brm_fits/attention_weights_utility_sim_<variant>_<range>_rep<k>_draws.rds`:
+the population-level draws, their summary and the sampler diagnostics). The
+chunk pools a variant's replicates by stacking their draws, which is the
+average of their posteriors: a cell's weight is the median of the pooled
+draws, its interval their 95% HDI, and its standard error (for the error
+column's noise floor) their SD divided by the square root of the number of
+replicates, since the weight averages over independent replicates. A variant
+with no file for a range is skipped. The data side of the figures and of the
+fits table's error column is the paper's brms weights (`weights_data`), so
+both sides are on the same estimator. The data
+through a plain logistic regression (`weights_data_glm`) are still computed for
+comparison, and the older regression with linear value channels, by study, is
+still run on ten simulated choices per trial for the value-slope table further
+down.
 
 ```{r oos-weights}
-plotted <- c("cond_lam", "cond_lam1", "type_lam", "type_lam1", "zero", "flat")
-weights_model <- list()
-slopes_model  <- list()
-for (name in plotted) {
-  if (is.null(runs[[name]])) next
-  tr <- runs[[name]]$loo$pred %>% transmute(Subject, Trial, WN, Study, p_left = p_left_heldout)
-  sw <- simulated_weights(tr, reps = 10, seed = 1)
-  weights_model[[name]] <- sw$weights
-  slopes_model[[name]]  <- sw$slopes
+plotted <- c("cond_lam", "cond_lam1", "type_lam", "zero", "flat")   # the variants in the paper
+
+# The cluster fits of one variant: every replicate's compact file, per range
+# condition -> one weights table in the layout of weights_data. The
+# replicates' posteriors are pooled by stacking their draws (the average of
+# the posteriors): estimate = median and lo / hi = 95% HDI of the pooled
+# draws; se = their SD / sqrt(replicates), the standard error of the average
+# over independent replicates. NULL when a range has no file.
+sim_draws_files <- function(name, rng) {
+  list.files(fit_dir, full.names = TRUE,
+             pattern = paste0("^attention_weights_utility_sim_", name, "_", tolower(rng), "_rep[0-9]+_draws\\.rds$"))
+}
+read_sim_weights <- function(name) {
+  weights <- tibble()
+  for (rng in c("Narrow", "Wide")) {
+    files <- sim_draws_files(name, rng)
+    if (length(files) == 0) { cat("No cluster fit for", name, rng, "\n"); return(NULL) }
+    draws <- bind_rows(lapply(files, function(f) as_tibble(readRDS(f)$draws) %>% select(matches("^b_"))))
+    cells <- names(draws) %>% str_subset("^b_[PNB]_(neg|pos)[0-9]+$") %>% str_remove("^b_")
+    for (cell in cells) {
+      x <- draws[[paste0("b_", cell)]]
+      h <- bayestestR::hdi(x, ci = 0.95)
+      weights <- bind_rows(weights, tibble(
+        WN = rng, term = cell, reps = length(files), estimate = median(x), se = sd(x) / sqrt(length(files)),
+        lo = h$CI_low, hi = h$CI_high
+      ))
+    }
+  }
+  weights %>% mutate(
+    type  = factor(str_sub(term, 1, 1), levels = c("N", "B", "P")),
+    value = as.numeric(str_extract(term, "[0-9]+$")) * if_else(str_detect(term, "_neg"), -1, 1),
+    WN    = factor(WN, levels = c("Narrow", "Wide"))
+  )
 }
 
-# The data through the same regression (for the slope table).
-sw_data <- cell_weight_glm(boxlong %>% mutate(TrialKey = Trial), pas %>% mutate(TrialKey = Trial))
+weights_model <- list()   # main-text specification, pooled, brms on the cluster: the figures and the fits table
+slopes_model  <- list()   # linear value channels, by study, plain regression on ten simulated choices: the slopes chunk
+for (name in plotted) {
+  weights_model[[name]] <- read_sim_weights(name)
+  if (is.null(runs[[name]])) next
+  tr <- runs[[name]]$loo$pred %>% transmute(Subject, Trial, WN, Study, p_left = p_left_heldout)
+  slopes_model[[name]]  <- simulated_weights(tr, reps = 10, seed = 1)$slopes
+}
+
+# Sampler diagnostics of the cluster fits: replicates back per variant and
+# range, hours per fit, and the worst diagnostics over the replicates.
+sim_diag <- tibble()
+for (name in plotted) for (rng in c("Narrow", "Wide")) {
+  files <- sim_draws_files(name, rng)
+  if (length(files) == 0) next
+  d <- bind_rows(lapply(files, function(f) {
+    x <- readRDS(f)
+    tibble(hours = x$elapsed_hours, divergent = x$n_divergent, treedepth = x$n_max_treedepth,
+           max_rhat = max(x$summary$rhat), min_ess_bulk = min(x$summary$ess_bulk))
+  }))
+  sim_diag <- bind_rows(sim_diag, tibble(
+    variant = name, range = rng, reps = nrow(d), hours_mean = round(mean(d$hours), 1),
+    divergent = sum(d$divergent), treedepth = sum(d$treedepth),
+    max_rhat = round(max(d$max_rhat), 3), min_ess_bulk = round(min(d$min_ess_bulk))
+  ))
+}
+as.data.frame(sim_diag)
+
+# The data through the same regressions.
+weights_data_glm <- utility_weight_glm(boxlong %>% mutate(TrialKey = Trial), pas %>% mutate(TrialKey = Trial))
+sw_data          <- cell_weight_glm(boxlong %>% mutate(TrialKey = Trial), pas %>% mutate(TrialKey = Trial))
 ```
 
 ## Main figure: data and the best model
@@ -612,58 +811,57 @@ sw_data <- cell_weight_glm(boxlong %>% mutate(TrialKey = Trial), pas %>% mutate(
 The paper gets two figures: this one (the data and the per-condition prior
 with loss aversion) and one supplementary figure (the per-condition prior
 without loss aversion, the per-type prior with loss aversion, the zero prior,
-the flat prior). The other comparisons below are shown here but not saved.
+the flat prior). Each panel overlays the data's weights (points with 95%
+intervals) and one model's weights (lines). This one is only drawn here: the
+paper's copy is `attribute_level_attention.pdf`, which `Main_Analysis.Rmd`
+draws from the same cluster fit. The other comparisons below are shown here
+but not saved.
 
-```{r fig-main, fig.width=2 * .figw, fig.height=2 * .figh}
-# Rows of data and model weights -> a (rows x studies) figure. The first row's
-# titles carry the study ("Study 1" over "Data"); later rows just carry their
-# label. With a `name`, saved under that name in paper/figures and
-# notebooks/notebook_figures; without one, only drawn.
-weights_figure <- function(rows, name = NULL, ylim = c(-0.5, 0.5)) {
+```{r fig-main, fig.width=1.3 * .figw, fig.height=1 * .figh}
+# One panel per model, each overlaying the data's weights (points, 95% CIs)
+# and that model's weights (lines). `models` is a named list of weight tables;
+# the names are the panel titles. With a `name`, saved under that name in
+# paper/figures and notebooks/notebook_figures; without one, only drawn.
+overlay_figure <- function(models, name = NULL, ncol = 2, data_w = weights_data, ylim = c(-0.5, 0.5)) {
   panels <- list()
-  for (row in names(rows)) {
-    for (s in 1:2) {
-      w <- rows[[row]]
-      title <- if (row == names(rows)[1]) paste0("Study ", s, "\n", row) else row
-      panels[[paste(row, s)]] <- if (is.null(w) || nrow(w) == 0) plot_spacer() else
-        plot_weights_by_range(w %>% filter(Study == s), title = title, ylim = ylim)
-    }
+  for (title in names(models)) {
+    w <- models[[title]]
+    panels[[title]] <- if (is.null(w) || nrow(w) == 0) plot_spacer() else plot_overlay(data_w, w, title, ylim)
   }
-  fig <- wrap_plots(panels, ncol = 2) + plot_layout(guides = "collect")
+  nrow <- ceiling(length(panels) / ncol)
+  fig  <- wrap_plots(panels, ncol = ncol) + plot_layout(guides = "collect")
   if (!is.null(name)) {
-    ggsave(file.path(fig_dir,    paste0(name, ".pdf")), fig, width = 2 * .figw, height = length(rows) * .figh)
-    ggsave(file.path(nb_fig_dir, paste0(name, ".pdf")), fig, width = 2 * .figw, height = length(rows) * .figh)
+    ggsave(file.path(fig_dir,    paste0(name, ".pdf")), fig, width = ncol * .figw, height = nrow * .figh)
+    ggsave(file.path(nb_fig_dir, paste0(name, ".pdf")), fig, width = ncol * .figw, height = nrow * .figh)
   }
   fig
 }
 
-weights_figure(list("Data" = weights_data,
-                    "Bayesian Model" = weights_model$cond_lam),
-               "bayesian_model")
+overlay_figure(list("Bayesian Model" = weights_model$cond_lam), ncol = 1)
 ```
 
-## Supplementary figure: data, per-condition prior without loss aversion, per-type prior, zero prior, flat prior
+## Supplementary figure: per-condition prior without loss aversion, per-type prior, zero prior, flat prior
 
-The data row is repeated so the reader can compare without flipping back to
-the main figure. The second row is the main model with $\lambda = 1$: without
-loss aversion the weights at the lowest aversive values should dip less far
-below zero than the data's (the table after the figure gives the numbers).
-Every other model row has $\lambda$ fitted.
+Four panels, each with the data's weights and one variant's. The first is the
+main model with $\lambda = 1$: without loss aversion the weights at the lowest
+aversive values should dip less far below zero than the data's (the table
+after the figure gives the numbers). The other three have $\lambda$ fitted.
 
-```{r fig-supp, fig.width=2 * .figw, fig.height=5 * .figh}
-weights_figure(list("Data" = weights_data,
-                    "Per-condition prior, no loss aversion" = weights_model$cond_lam1,
+```{r fig-supp, fig.width=2 * .figw, fig.height=2 * .figh}
+overlay_figure(list("Per-condition prior, no loss aversion" = weights_model$cond_lam1,
                     "Per-type prior" = weights_model$type_lam,
                     "Zero prior" = weights_model$zero,
                     "Flat prior" = weights_model$flat),
-               "bayesian_model_supp")
+               name = "bayesian_model_supp")
 ```
 
 ```{r dip-table}
 # Attention weight at the lowest aversive value of each range condition
-# (Narrow -30, Wide -50), by study, for the data, the main model and the main
-# model without loss aversion: the comparison the figure's second row is for.
-dip_rows <- list("Data"                            = weights_data,
+# (Narrow -30, Wide -50) for the data (brms, and a plain regression for
+# comparison), the main model and the main model without loss aversion: the
+# comparison the supplementary figure's first panel is for.
+dip_rows <- list("Data (brms)"                     = weights_data,
+                 "Data (glm)"                      = weights_data_glm,
                  "Per-condition prior"             = weights_model$cond_lam,
                  "Per-condition prior, lambda = 1" = weights_model$cond_lam1)
 dip <- tibble()
@@ -671,21 +869,16 @@ for (nm in names(dip_rows)) {
   w <- dip_rows[[nm]]
   if (is.null(w) || nrow(w) == 0) next
   lowest <- w %>% filter(type == "N") %>%
-    group_by(Study, WN) %>% slice_min(value, n = 1, with_ties = FALSE) %>% ungroup()
-  dip <- bind_rows(dip, lowest %>% transmute(source = nm, Study, WN, value, estimate, lo, hi))
+    group_by(WN) %>% slice_min(value, n = 1, with_ties = FALSE) %>% ungroup()
+  dip <- bind_rows(dip, lowest %>% transmute(source = nm, WN, value, estimate, lo, hi))
 }
+
 # One weight from the table, formatted (for the notes).
-dip_at <- function(src, s, rng) {
-  x <- dip %>% filter(source == src, Study == s, WN == rng)
+dip_at <- function(src, rng) {
+  x <- dip %>% filter(source == src, WN == rng)
   if (nrow(x) == 0) "NA" else sprintf("%.2f", x$estimate)
 }
-dip %>% arrange(Study, WN, source) %>% mutate(across(c(estimate, lo, hi), \(x) round(x, 3))) %>% as.data.frame()
-```
-
-## Not in the paper: the per-type prior without loss aversion
-
-```{r fig-lam1, fig.width=2 * .figw, fig.height=1 * .figh}
-weights_figure(list("Per-type prior, lambda = 1" = weights_model$type_lam1))
+dip %>% arrange(WN, source) %>% mutate(across(c(estimate, lo, hi), \(x) round(x, 3))) %>% as.data.frame()
 ```
 
 ## Crossovers and value slopes
@@ -698,21 +891,24 @@ B against P and N within a condition: per-type units predict a B/P slope ratio
 of 0.79 in Narrow and 1.20 in Wide, points predict 1 in both.
 
 ```{r slopes}
-# Crossovers: the data (brms, and through the same glm as the models) and every
-# model (glm on held-out simulations).
+# Crossovers (main-text specification, pooled over studies): the data (brms,
+# and through a plain regression for comparison) and every model (brms on its
+# held-out simulated choices).
 cross <- crossover_table(weights_data, "Data (brms)")
-cross <- bind_rows(cross, crossover_table(sw_data$weights, "Data (glm)"))
+cross <- bind_rows(cross, crossover_table(weights_data_glm, "Data (glm)"))
 for (name in names(weights_model)) cross <- bind_rows(cross, crossover_table(weights_model[[name]], variants[[name]]$label))
-cross_wide <- cross %>% pivot_wider(names_from = c(WN), values_from = crossover) %>% arrange(Study, type, source)
+cross_wide <- cross %>% pivot_wider(names_from = c(WN), values_from = crossover) %>% arrange(type, source)
 as.data.frame(cross_wide)
 
-# Value slopes: data (same glm) and every model.
+# Value slopes (linear value channels, by study): data and every model through
+# the same plain regression. The pooled crossovers are attached to both studies'
+# rows.
 slope_tbl <- sw_data$slopes %>% mutate(source = "Data (glm)")
 for (name in names(slopes_model)) slope_tbl <- bind_rows(slope_tbl, slopes_model[[name]] %>% mutate(source = variants[[name]]$label))
 slope_wide <- slope_tbl %>% select(source, Study, type, WN, estimate) %>%
   pivot_wider(names_from = WN, values_from = estimate) %>%
   mutate(ratio = Wide / Narrow) %>%
-  left_join(cross_wide %>% rename(cross_Narrow = Narrow, cross_Wide = Wide), by = c("source", "Study", "type")) %>%
+  left_join(cross_wide %>% rename(cross_Narrow = Narrow, cross_Wide = Wide), by = c("source", "type")) %>%
   arrange(Study, type, source)
 slope_wide %>% mutate(across(where(is.numeric), \(x) round(x, 3))) %>% as.data.frame()
 ```
@@ -729,13 +925,134 @@ save_kable <- function(df, name, digits = 3) {
   cat(as.character(tex), "\n")
 }
 
-fits_tbl <- params %>%
-  select(label, range, s0, q, lambda, nll) %>%
-  left_join(loo_table %>% select(label, total_ll, per_trial, diff_total, diff_mean, diff_se), by = "label") %>%
-  rename(Model = label, Range = range, `s0` = s0, `q` = q, `lambda` = lambda, `NLL (fit)` = nll,
-         `Held-out LL` = total_ll, `per trial` = per_trial,
-         `vs main: total` = diff_total, `mean` = diff_mean, `SE` = diff_se)
-save_kable(fits_tbl, "bayesian_model_fits")
+# The paper's table of estimates: the main model, the main model without loss
+# aversion, the per-type prior, the zero prior and the flat prior (all with
+# loss aversion unless the title says otherwise), under the titles used in the
+# paper (the second title is two lines).
+fits_titles <- c(cond_lam  = "Per-Condition Prior",
+                 cond_lam1 = "\\shortstack[l]{Per-Condition Prior\\\\No Loss Aversion}",
+                 type_lam  = "Per-Type Prior",
+                 zero      = "Zero Prior",
+                 flat      = "Flat Prior")
+fits_ll <- setNames(loo_table$total_ll, loo_table$variant)
+
+# Difference in out-of-sample log-likelihood from the main model: the mean
+# across participants, with the p-value of a paired t-test across participants
+# (two-sided; each participant's log-likelihood under the variant against
+# under the main model). The p-value is written as a bare number, formatted
+# like fmt_p in the main notebook: three decimals, or scientific notation below
+# .001 (the column header says it is the p-value). "--" for the main model
+# itself.
+fmt_delta_p <- function(name) {
+  if (name == "cond_lam") return("--")
+  x  <- subj_ll %>% filter(variant %in% c(name, "cond_lam")) %>% pivot_wider(names_from = variant, values_from = ll)
+  p  <- t.test(x[[name]], x[["cond_lam"]], paired = TRUE)$p.value
+  p_txt <- if (p < 0.001) formatC(p, format = "e", digits = 0) else sprintf("%.3f", p)
+  sprintf("%.2f (%s)", mean(x[[name]] - x[["cond_lam"]]), p_txt)
+}
+
+# Prior variance in points^2 of one variant in one range condition: the prior
+# SD is s0 times the SD of the reference distribution (box_prior_sd in the
+# model code), squared. The per-condition reference has one SD; the per-type
+# reference has one per attribute type, returned named, in the order N, B, P.
+prior_variance <- function(name, rng) {
+  ref <- reference_distributions(boxlong, variants[[name]]$prior_ref) %>% filter(WN == rng)
+  ref <- ref[match(c("N", "B", "P"), as.character(ref$type)), ]
+  v   <- setNames((runs[[name]]$fit$s0[[rng]] * ref$sd)^2, c("N", "B", "P"))
+  if (variants[[name]]$prior_ref == "cond") v <- unname(v[1])
+  v
+}
+
+# Variances as one string for a table cell, rounded to whole points^2: "309",
+# or, for the per-type prior, "88, 140": the variance of the negative and
+# positive types (NP),
+# then that of the ambivalent type (B). Negative and positive values mirror
+# each other, so their variances are equal (checked). Numbers of a hundred
+# thousand or more (the flat prior) go in powers of ten.
+fmt_variance <- function(v) {
+  txt <- c()
+  for (x in v) {
+    if (x < 1e5) {
+      txt <- c(txt, sprintf("%.0f", x))
+    } else {
+      e   <- floor(log10(x))
+      txt <- c(txt, sprintf("$%.1f \\times 10^{%d}$", x / 10^e, e))
+    }
+  }
+  if (is.null(names(v))) return(txt)
+  stopifnot(isTRUE(all.equal(v[["N"]], v[["P"]])))
+  paste(txt[names(v) == "N"], txt[names(v) == "B"], sep = ", ")
+}
+
+# Attention-weight error of a variant: the mean, over the 36 cells (18 per
+# range condition), of the absolute difference between the weight estimated
+# from the variant's out-of-sample simulated choices (the same brms model as
+# the data's, on the cluster) and the data's weight (the paper's brms fit). Its noise
+# floor is the error a variant that predicted the data's true weights would
+# still show, because both estimates carry sampling error: per cell, the
+# expected absolute value of a normal variable with variance SE_data^2 +
+# SE_sim^2 (the data's posterior SD; the SD of the variant's pooled replicate
+# draws over sqrt(replicates)), sqrt(2 / pi) * sqrt(SE_data^2 + SE_sim^2),
+# averaged over the cells.
+attn_error <- function(name) {
+  x <- weights_model[[name]] %>% select(WN, term, est_sim = estimate, se_sim = se) %>%
+    inner_join(weights_data %>% select(WN, term, est_data = estimate, se_data = se), by = c("WN", "term"))
+  stopifnot(nrow(x) == 36)
+  c(mae = mean(abs(x$est_sim - x$est_data)), floor = mean(sqrt(2 / pi) * sqrt(x$se_data^2 + x$se_sim^2)))
+}
+attn_errors <- sapply(names(fits_titles), attn_error)   # rows mae / floor, one column per variant
+floors      <- attn_errors["floor", ]
+floor_txt   <- if (max(floors) - min(floors) < 0.0005) sprintf("%.3f", mean(floors)) else
+  sprintf("between %.3f and %.3f", min(floors), max(floors))
+print(round(attn_errors, 4)); cat("noise floor (not in the table note):", floor_txt, "\n")
+
+# The tabular is written by hand: every model gets two rows (Narrow, Wide),
+# with its title, lambda, out-of-sample log-likelihood and its difference from
+# the main model spanning both rows (\multirow), and a rule between models. The
+# column padding is narrowed inside a group so that the ten columns fit the
+# page; it needs the multirow package in the paper's preamble.
+fits_lines <- c("{\\setlength{\\tabcolsep}{3.5pt}%", "\\begin{tabular}{llrrrrrrrr}", "\\toprule",
+                paste("Model & Range & $\\sigma^2_p (\\text{NP}, \\text{B})$ & $q$ & $\\lambda$ & $\\exp(\\mu)$ & $\\tau$ & OOS-LL &",
+                      "\\shortstack[c]{$\\Delta^{\\text{OOS-LL}}_{\\text{Participants}}$\\\\(\\textit{p}-value)} &",
+                      "\\shortstack[c]{OOS-MAE\\\\Attn. Weights} \\\\"),
+                "\\midrule")
+for (name in names(fits_titles)) {
+  f <- runs[[name]]$fit
+  # One lambda for both ranges in all five models, so one cell can hold it.
+  stopifnot(isTRUE(all.equal(f$lambda[["Narrow"]], f$lambda[["Wide"]])))
+  for (rng in c("Narrow", "Wide")) {
+    first <- rng == "Narrow"
+    cells <- c(
+      if (first) sprintf("\\multirow{2}{*}{%s}", fits_titles[[name]]) else "",
+      rng,
+      fmt_variance(prior_variance(name, rng)),
+      sprintf("%.2f", f$q[[rng]]),
+      if (first) sprintf("\\multirow{2}{*}{%.2f}", f$lambda[[rng]]) else "",
+      sprintf("%.2f", exp(f$mu[[rng]])),
+      sprintf("%.2f", f$tau[[rng]]),
+      if (first) sprintf("\\multirow{2}{*}{%.0f}", fits_ll[[name]]) else "",
+      if (first) sprintf("\\multirow{2}{*}{%s}", fmt_delta_p(name)) else "",
+      if (first) sprintf("\\multirow{2}{*}{%.3f}", attn_errors["mae", name]) else "")
+    fits_lines <- c(fits_lines, paste0(paste(cells, collapse = " & "), " \\\\"))
+  }
+  if (name != names(fits_titles)[length(fits_titles)]) fits_lines <- c(fits_lines, "\\midrule")
+}
+# The note spans the text width, in a smaller font, under the table (the same
+# layout as the notes of the regression tables).
+fits_note <- paste("\\textit{Note.} $\\sigma^2_p (\\text{NP}, \\text{B})$ jointly reports the prior variance for negative and positive",
+                   "attribute types, since by definition this was the same in these two attribute types. Then, it reports",
+                   "the prior variance for ambivalent attribute types, which had a wider range of possible values.",
+                   "For $\\Delta^{\\text{OOS-LL}}_{\\text{Participants}}$, we took the out-of-sample log-likelihood of every",
+                   "participant for every variant, then compared the difference between a variant's log-likelihood and the",
+                   "best model's log-likelihood across all participants (the mean difference per participant, with the",
+                   "p-value of a paired t-test across participants in parentheses).",
+                   "OOS-MAE Attn. Weights is the mean, over the 36 cells (value $\\times$ attribute type $\\times$ range),",
+                   "of the absolute difference between the attentional weight estimated from a variant's out-of-sample",
+                   "simulated choices and the data's attentional weight.")
+fits_lines <- c(fits_lines, "\\bottomrule", "\\end{tabular}}", "\\par\\medskip",
+                paste0("\\begin{minipage}{\\linewidth}\\footnotesize ", fits_note, "\\end{minipage}"))
+writeLines(fits_lines, file.path(tab_dir, "bayesian_model_fits.tex"))
+cat(fits_lines, sep = "\n")
 
 slopes_out <- slope_wide %>%
   rename(Source = source, Type = type, `Narrow slope` = Narrow, `Wide slope` = Wide, `Wide / Narrow` = ratio,
@@ -767,6 +1084,58 @@ best <- runs$cond_lam$fit
 save_text(sprintf("$q^{\\text{Narrow}} = %.2f$, $q^{\\text{Wide}} = %.2f$, $\\lambda = %.2f$",
                   best$q[["Narrow"]], best$q[["Wide"]], best$lambda[[1]]),
           "bayes_best_params")
+
+# Slow numbers that depend only on the fitted parameters (the numerical checks
+# below, the participants' log-likelihoods on the sigma grid) are kept in
+# results/temp, so that a render that only changes a table or a sentence does
+# not recompute them. A saved result is used only when the parameters stored
+# with it are identical to the current fit's; after changing the model code or
+# the grids, delete the .rds file in results/temp to force a recompute.
+temp_dir <- file.path(paths$root, paths$results$temp)
+dir.create(temp_dir, showWarnings = FALSE, recursive = TRUE)
+load_temp <- function(name, par) {
+  f <- file.path(temp_dir, paste0(name, ".rds"))
+  if (!file.exists(f)) return(NULL)
+  x <- readRDS(f)
+  if (identical(x$par, par)) x else NULL
+}
+save_temp <- function(x, name) saveRDS(x, file.path(temp_dir, paste0(name, ".rds")))
+
+# Numerical checks at the fitted parameters of the main model, for the
+# supplement: how much the log-likelihood moves when the sigma grid is doubled
+# (60 -> 120 points) and when the utility grid's spacing is halved, and how far
+# off the normal approximation that the exact calculation replaced was.
+fmt_sci  <- function(x) { x <- abs(x); e <- floor(log10(x)); sprintf("$%.1f \\times 10^{%d}$", x / 10^e, e) }
+par_best <- list(s0 = best$s0, q = best$q, lambda = best$lambda)
+checks   <- load_temp("bayes_numerical_checks", par_best)
+if (is.null(checks)) {
+  nll_exact  <- profile_total(prep_cond, par_best)
+  nll_probit <- profile_total(prep_cond, par_best, exact = FALSE)
+  GRID_FACTOR <- 0.25                                      # half the usual spacing (the functions read this at call time)
+  nll_fine <- profile_total(prep_cond, par_best)
+  GRID_FACTOR <- 0.5
+  grid_saved <- list(log = SIGMA_GRID_LOG, grid = SIGMA_GRID, mu = MU_BOUNDS)
+  SIGMA_GRID_LOG <- seq(log(0.005), log(500), length.out = 120); SIGMA_GRID <- exp(SIGMA_GRID_LOG); MU_BOUNDS <- range(SIGMA_GRID_LOG)
+  nll_sigma <- profile_total(prep_cond, par_best)
+  SIGMA_GRID_LOG <- grid_saved$log; SIGMA_GRID <- grid_saved$grid; MU_BOUNDS <- grid_saved$mu
+  # The largest difference between the probit and the exact probability on any
+  # trial at any sigma of the grid.
+  max_err <- 0
+  for (s in names(prep_cond$subj)) {
+    piece <- prep_cond$subj[[s]]
+    sig   <- matrix(SIGMA_GRID, nrow(piece$boxes), length(SIGMA_GRID), byrow = TRUE)
+    p_e   <- exp(piece_choice_logprob(piece, variants$cond_lam, sig, par_best)$left)
+    p_p   <- exp(piece_choice_logprob(piece, variants$cond_lam, sig, par_best, exact = FALSE)$left)
+    max_err <- max(max_err, abs(p_e - p_p))
+  }
+  checks <- list(par = par_best, nll_exact = nll_exact, nll_probit = nll_probit,
+                 nll_fine = nll_fine, nll_sigma = nll_sigma, max_err = max_err)
+  save_temp(checks, "bayes_numerical_checks")
+}
+save_text(fmt_sci(checks$nll_sigma - checks$nll_exact), "bayes_check_sigma_grid")
+save_text(fmt_sci(checks$nll_fine - checks$nll_exact),  "bayes_check_utility_grid")
+save_text(sprintf("%.1f", abs(checks$nll_probit - checks$nll_exact)), "bayes_probit_error")
+save_text(sprintf("%.3f", checks$max_err), "bayes_probit_max_error")
 rp <- ref_pts %>% filter(variant == "cond_lam", type == "P")
 save_text(sprintf("$%.0f$ points in Narrow and $%.0f$ points in Wide", rp$reference[rp$WN == "Narrow"], rp$reference[rp$WN == "Wide"]), "bayes_best_reference")
 save_text(sprintf("$\\lambda^{\\text{Narrow}} = %.2f$, $\\lambda^{\\text{Wide}} = %.2f$", runs$cond_lamcond$fit$lambda[["Narrow"]], runs$cond_lamcond$fit$lambda[["Wide"]]), "bayes_lambda_by_range")
@@ -775,16 +1144,22 @@ save_text(paste0("$\\Delta^{\\text{per-condition - per-type}} = ", fmt_delta("co
 save_text(paste0("$\\Delta^{\\text{per-condition - flat}} = ", fmt_delta("cond_lam", "flat"), "$, ",
                  "$\\Delta^{\\text{per-condition - zero}} = ", fmt_delta("cond_lam", "zero"), "$"), "bayes_loo_flat_zero")
 if (exists("grp_df")) {
-  # Pearson r between true and recovered values, all on the linear scale; sigma
-  # by study (one point per participant and dataset), q over both range
-  # conditions, lambda over datasets.
+  # Pearson r between true and recovered values. q, mu and tau on their own
+  # scale, over both range conditions; lambda (one point per dataset) and
+  # sigma (one point per participant and dataset, by study; the recovered
+  # value is the posterior mean) on the log scale, the same scale as the
+  # recovery chunk's summary: lambda is drawn log-uniformly and sigma is
+  # log-normal across participants, so on the log scale every dataset and
+  # participant counts alike instead of the few noisiest participants
+  # dominating. The snippet says which values are on the log scale.
   r_sigma <- c()
   for (s in 1:2) {
     x <- sig_df %>% filter(Study == s)
-    r_sigma[s] <- cor(x$true, x$recovered)
+    r_sigma[s] <- cor(log(x$true), log(x$recovered))
   }
-  save_text(sprintf("$r^{q} = %.2f$, $r^{\\lambda} = %.2f$, $r^{\\sigma}_{\\text{Study 1}} = %.2f$, $r^{\\sigma}_{\\text{Study 2}} = %.2f$",
-                    cor(grp_df$true_q, grp_df$rec_q), cor(lam_df$true_lambda, lam_df$rec_lambda), r_sigma[1], r_sigma[2]),
+  save_text(sprintf("$r^{q} = %.2f$, $r^{\\mu} = %.2f$, $r^{\\tau} = %.2f$, and on the log scale $r^{\\lambda} = %.2f$, $r^{\\sigma_x}_{\\text{Study 1}} = %.2f$, $r^{\\sigma_x}_{\\text{Study 2}} = %.2f$",
+                    cor(grp_df$true_q, grp_df$rec_q), cor(grp_df$true_mu, grp_df$rec_mu), cor(grp_df$true_tau, grp_df$rec_tau),
+                    cor(log(lam_df$true_lambda), log(lam_df$rec_lambda)), r_sigma[1], r_sigma[2]),
             "bayes_recovery")
 }
 save_text(sprintf("%s", format(prep_cond$n_dropped, big.mark = ",")), "bayes_dropped_trials")
@@ -816,7 +1191,120 @@ cat(as.character(tex), "\n")
 
 ---
 
+# Sampling noise by range condition
+
+The main text says that sampling noise per second is lower in the Narrow
+condition than in the Wide condition. The fitted populations put the median
+$\sigma$, $\exp(\mu)$, at 5.9 points per second in Narrow and 8.8 in Wide, but
+the fit gives no standard error for $\mu$ (Nelder-Mead, no Hessian). So the
+test is a bootstrap over participants: resample the participants of each
+condition with replacement, refit that condition's population $(\mu, \tau)$,
+repeat. This is cheap because, given the fitted $q$ and $\lambda$ of the main
+model, every participant's log-likelihood on the $\sigma$ grid is one grid pass
+(`grid_pass`, about two minutes) and a condition's population step is a
+Nelder-Mead on its participants' rows of that matrix (`fit_population`, a few
+hundredths of a second per replicate). $q$ and $\lambda$ stay at their fitted
+values, so the interval leaves out their (small) uncertainty.
+
+The statistic for the paper is the difference in the population median of
+$\sigma$, $\exp(\mu^{\text{Wide}}) - \exp(\mu^{\text{Narrow}})$ in points per
+second: the point estimate from the full fit, the 95% interval from the
+bootstrap percentiles. Participants are in one range condition each, so the
+two conditions are resampled independently. This is deliberately not a t-test
+on the participants' posterior-mean $\sigma$'s: those are shrunk toward their
+own condition's population, so a test on them partly restates the difference
+in $\mu$. (`save_text` and `load_temp` come from the Text Output chunk above.)
+
+```{r sigma-range}
+set.seed(1)
+B <- 1000
+
+# Every participant's log-likelihood on the sigma grid at the fitted group
+# parameters of the main model (participants x grid).
+fit_main <- runs$cond_lam$fit
+par_main <- list(s0 = fit_main$s0, q = fit_main$q, lambda = fit_main$lambda)
+cached   <- load_temp("bayes_sigma_grid_ll", par_main)   # ~100 s to compute (see load_temp)
+if (is.null(cached)) {
+  ll_main <- grid_pass(prep_cond, par_main)
+  save_temp(list(par = par_main, ll_main = ll_main), "bayes_sigma_grid_ll")
+} else {
+  ll_main <- cached$ll_main
+}
+
+# Check: the population step on these rows reproduces the cached fit.
+for (cc in c("Narrow", "Wide")) {
+  pop <- fit_population(ll_main[prep_cond$subjects$Subject[prep_cond$subjects$WN == cc], , drop = FALSE])
+  cat(sprintf("%s: mu = %.4f (fit %.4f), tau = %.4f (fit %.4f)\n", cc, pop$mu, fit_main$mu[[cc]], pop$tau, fit_main$tau[[cc]]))
+}
+
+# Bootstrap: resample participants within each condition and refit (mu, tau).
+subs     <- split(prep_cond$subjects$Subject, prep_cond$subjects$WN)
+boot     <- tibble()
+not_conv <- 0
+for (b in 1:B) {
+  row <- c()
+  for (cc in names(subs)) {
+    s   <- sample(subs[[cc]], replace = TRUE)
+    pop <- fit_population(ll_main[s, , drop = FALSE])
+    not_conv <- not_conv + (pop$convergence != 0)
+    row[paste0("mu_", cc)]  <- pop$mu
+    row[paste0("tau_", cc)] <- pop$tau
+  }
+  boot <- bind_rows(boot, as_tibble_row(row))
+}
+cat("population steps not converged:", not_conv, "of", 2 * B, "\n")
+
+# Difference in the population median sigma (points per second), Wide minus
+# Narrow: point estimate from the full fit, 95% percentile interval from the
+# bootstrap. The log-scale difference and the bootstrap SDs are printed for
+# the record.
+boot <- boot %>% mutate(d_median = exp(mu_Wide) - exp(mu_Narrow), d_mu = mu_Wide - mu_Narrow)
+est  <- exp(fit_main$mu[["Wide"]]) - exp(fit_main$mu[["Narrow"]])
+ci   <- quantile(boot$d_median, c(0.025, 0.975))
+cat(sprintf("exp(mu): Narrow %.2f, Wide %.2f; difference %.2f [%.2f, %.2f]; log difference %.3f (bootstrap SD %.3f)\n",
+            exp(fit_main$mu[["Narrow"]]), exp(fit_main$mu[["Wide"]]), est, ci[1], ci[2],
+            fit_main$mu[["Wide"]] - fit_main$mu[["Narrow"]], sd(boot$d_mu)))
+boot %>% summarise(across(everything(), list(mean = mean, sd = sd))) %>% as.data.frame()
+
+save_text(sprintf("$\\Delta^{\\text{Wide} - \\text{Narrow}}_{\\exp(\\mu)} = %.2f\\ [%.2f, %.2f]$", est, ci[1], ci[2]),
+          "bayes_sigma_range")
+```
+
+---
+
 # Notes
+
+Fifth run, 2026-10-30/31: exact choice probabilities and 12-fold
+cross-validation. The probit $\Phi(\Delta / \sqrt{v})$ is exact only at
+$\lambda = 1$ (each box's utility is a normal whose lower half is stretched by
+$\lambda$, so the left-right difference is not normal); it is replaced by the
+convolution on a grid of utility values (`exact_choice_prob.cpp`: cell width
+half the smallest box SD, Richardson extrapolation over three spacings), with
+the probit kept only where it is exact. The 60-fold leave-one-trial-out became
+12 folds of five trial positions per subject, since every fold is a full fit
+of about an hour with the exact probabilities (60 folds would have been about
+380 process-hours). The recovery's cap on stage-3 evaluations rose from 60 to
+200, the same as the real data.
+
+**Headline.** The full fits land on the probit optimum to three decimals:
+$q = 0.22$ / $0.19$, $\lambda = 1.06$, in-sample NLL 29875.8 (the probit was
+off by 0.7 units in total, at most 0.007 per trial). Held-out NLL over the
+58,122 trials: main model 29943; without loss aversion 29963 ($+20$);
+$\lambda$ per condition 29931 ($-12$; 1.12 Narrow, 1.00 Wide); per-type prior
+30184 ($+241$); zero prior 30270 ($+327$); flat prior 30377 ($+434$). These
+are not comparable to the fourth run's held-out numbers: with five trials held
+out, a subject's posterior over $\sigma$ rests on 55 (or 19 to 25) training
+trials instead of 59, so every variant predicts a little worse by design; the
+ranking is unchanged and the gap to the $\lambda = 1$ model is 20 units (34
+before). Across the main model's 12 folds $q$ ranges 0.20 to 0.22 (Narrow) and
+0.17 to 0.20 (Wide) and $\lambda$ 1.05 to 1.08. Nelder-Mead stopped on its
+tolerance in every full fit, in every fold of every variant and in all 20
+recovery datasets. Recovery: $r^q = 0.999$, $r^\lambda = 0.999$ (log scale),
+$r^\mu = 0.997$, $r^\tau = 0.985$, $r^\sigma$ (log) 0.84 / 0.90 by study.
+Timing: 87 jobs, seven at a time, 20:36 to 09:28 on an 8-core M2 laptop; a
+main-model fold 55 to 74 minutes, a recovery dataset 50 minutes at
+$\lambda \approx 1$ and 5.5 hours at $\lambda = 2.6$ (a larger $\lambda$
+stretches the utility grid).
 
 Fourth run, 2026-10-29 (evening): $\lambda$ fitted in every variant by the
 same algorithm. The zero and flat priors fix $q$ at 0.5 (an objective 0 for
@@ -838,12 +1326,13 @@ under $\lambda < 1$, so a held-out error cost them more; half of the subjects
 gain and the median trial is unchanged. The supplementary figure
 gained the main model with $\lambda = 1$ as its second row, and the paper's
 comparison table dropped the per-type $\lambda = 1$ row. At the lowest aversive
-value of Study 2 Narrow ($-30$) the data's weight is
-`r dip_at("Data", 2, "Narrow")`, the main model's
-`r dip_at("Per-condition prior", 2, "Narrow")` and the $\lambda = 1$ model's
-`r dip_at("Per-condition prior, lambda = 1", 2, "Narrow")` (Study 2 Wide, $-50$:
-`r dip_at("Data", 2, "Wide")`, `r dip_at("Per-condition prior", 2, "Wide")`,
-`r dip_at("Per-condition prior, lambda = 1", 2, "Wide")`); the fitted $\lambda$
+value of the Narrow condition ($-30$; pooled over studies, data through the
+same plain regression as the models) the data's weight is
+`r dip_at("Data (glm)", "Narrow")`, the main model's
+`r dip_at("Per-condition prior", "Narrow")` and the $\lambda = 1$ model's
+`r dip_at("Per-condition prior, lambda = 1", "Narrow")` (Wide, $-50$:
+`r dip_at("Data (glm)", "Wide")`, `r dip_at("Per-condition prior", "Wide")`,
+`r dip_at("Per-condition prior, lambda = 1", "Wide")`); the fitted $\lambda$
 of 1.07 is a 7 percent amplification, so the two model rows differ by
 hundredths and both undershoot the data.
 

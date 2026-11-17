@@ -19,9 +19,11 @@ After exclusions the analyzed samples are 981 participants / 28,646 trials in St
 
 ## Status
 
-Manuscript drafted end to end and carries `\textcolor{red}{...}` placeholders where sample details are still owed by collaborators. [docs/TODO.md](docs/TODO.md) is the worklist, but it was last revised 2026-08-10 and predates the Bayesian-model work — read it against the current `main.tex` before trusting it.
+Manuscript drafted end to end. One `\textcolor{red}{...}` placeholder is left — the data/code availability URL in the Transparency statement. [docs/TODO.md](docs/TODO.md) is the worklist, but it was last revised 2026-08-10 and predates the Bayesian-model work — read it against the current `main.tex` before trusting it.
 
 Naming note: the two studies in the paper are **Study 1 = PAS3** and **Study 2 = PAS4**. PAS1 and PAS2 were earlier pilots; their processed data is still in `data/processed/`, but no current notebook reads it.
+
+Wording note: what the mouse-tracking record measures is now called a **dwell** throughout the notebook and the manuscript, not a fixation, and "last-fixated" is now "last-seen". The outputs were renamed with it — `dwell_properties.{pdf,tex}`, `dwelldur_{type,value,range}.tex`, `lastseen_bias.tex`, `netdwell_{dwell,range}.tex`. The old `fixation_properties.*`, `fixdur_*`, `lastfix_bias`, `netfix_*` files are still sitting in `paper/figures|tables|text_output/` but nothing writes or includes them any more; the chunk names inside `Main_Analysis.Rmd` (`fix-first`, `fix-duration`, …) and the column names in the data (`FixROI`, `FixDur`) also still use the old word.
 
 ---
 
@@ -73,7 +75,7 @@ rmarkdown::render("notebooks/Main_Analysis.Rmd")
 
 `Main_Analysis.Rmd` has a `RUN_REGRESSIONS` switch. `FALSE` is a fast, figures-only pass that draws the attribute-level panels from the cached `brms` fits in `notebooks/brm_fits/` and the cached Bayesian-model predictions. `TRUE` fits every regression, writes the LaTeX tables and in-text statistics, and samples any `brms` model whose cache is missing — the two attention-weight fits take many hours each the first time, so run them from a terminal instead (below). `bayesian_model.Rmd` has the analogous `RUN_FITS`. `brm()` caches through its `file` argument; **delete the `.rds` to force a refit.**
 
-Sections of `Main_Analysis.Rmd`, in the order of the Results: Basic Psychometrics (including the range-sensitivity simulations), Fixation Properties, Option-Level Attention (net- and last-fixation bias), Attribute-Level Attention (design matrices, fits, figures, tables), Range Sensitivity, and an *Extra Analyses* section that is switched off by default (the pre-registered linear-value-channel specification, the by-study and range-pooled attention weights, the brms range-sensitivity fit, participant-level out-of-sample log-likelihoods, and convergence checks).
+Sections of `Main_Analysis.Rmd`, in the order of the Results: Basic Psychometrics (including the range-sensitivity simulations), Dwell Properties, Option-Level Attention (net-dwell and last-seen bias), Attribute-Level Attention (design matrices, fits, figures, tables), Range Sensitivity, and an *Extra Analyses* section that is switched off by default (the pre-registered linear-value-channel specification, the by-study and range-pooled attention weights, the brms range-sensitivity fit, participant-level out-of-sample log-likelihoods, and convergence checks).
 
 Knitted `.html` is tracked, so the rendered results are readable from GitHub without running anything.
 
@@ -105,6 +107,26 @@ Every job caches its own output, so the queue can be re-run after an interruptio
 ### Range-sensitivity simulations
 
 Four models of value normalization, sharing the setup in `code/simulation/simulate_normalized_choices.R` and feeding the appendix figure: `simulate_range_normalization.R` (Padoa-Schioppa; Soltani et al.; Kőszegi & Szeidl), `simulate_rank_normalization.R` (decision by sampling), `simulate_context_divisive_normalization.R` and `simulate_trial_divisive_normalization.R` (divisive normalization by the condition's context and within the trial). `simulate_ddm.R` is a bare drift-diffusion simulator, groundwork for an aDDM section.
+
+---
+
+## Standalone figure scripts
+
+`code/visualization/` holds figure scripts that stand outside the notebook pipeline. **They do not read the data** — the numbers are pasted in from the paper, so they have to be re-pasted whenever the underlying fit changes:
+
+| Script | Output | Numbers come from |
+|--------|--------|-------------------|
+| `bayesian-model-plots.R` | `results/figures/bayesian-model-{narrow,wide}-r[-with-predictions].png` — attention weight against attribute value, with HDIs and the model overlay | Tables S6/S7 and Figure 5 of the manuscript, hardcoded (the model curve was recovered from the PDF's vector paths) |
+| `task_attribute_range_subfigure.R` | `attribute_range_subfigure.{png,pdf}` — the Narrow/Wide value sets by attribute type | The task design, hardcoded |
+
+```bash
+Rscript code/visualization/bayesian-model-plots.R [output_dir]
+Rscript code/visualization/task_attribute_range_subfigure.R
+```
+
+Neither resolves paths through `config/paths.yaml`: `bayesian-model-plots.R` defaults to an absolute `results/figures` path on Brenden's machine (pass an output directory to override), and `task_attribute_range_subfigure.R` writes into the working directory under a different name than the copy kept at `results/figures/task_attribute_range_subfigure.png`. Base graphics and `ggplot2` only — no `getAllUtilities.R`, no `brms`.
+
+`results/figures/presentation/` holds talk figures (`attention_anchor_schematic`, `attention_theta_vs_bayesian_schematic`, `sampling_noise_distributions`) that have no generating script in the repository.
 
 ---
 
@@ -172,7 +194,8 @@ aversive-attributes/
 │   ├── fitting/                 # ML fits, terminal samplers, Compute Canada array job
 │   ├── parameter_recovery/recover_bayesian_attributes.R
 │   ├── power_analysis/power_analysis_for_attn_weights.R
-│   ├── behavior/  empirics/  visualization/    # (empty — scaffold)
+│   ├── visualization/           # Standalone figure scripts (hardcoded numbers, no data)
+│   ├── behavior/  empirics/     # (empty — scaffold)
 │
 ├── experiments/                 # Task materials, per-study details, trial generation
 │   ├── generate_Trials.R        # Builds TrialsNBPN.csv / TrialsPBPN.csv (seed 1337)
@@ -190,7 +213,8 @@ aversive-attributes/
 ├── results/
 │   ├── cache/bayesian_model/    # Model fits, cross-validation folds, recovery datasets
 │   ├── compute_canada/          # inputs/, outputs/, smoke/ for the cluster array
-│   └── figures/  tables/  models/  logs/  temp/
+│   ├── figures/                 # paper/, exploratory/, presentation/, plus standalone script output
+│   └── tables/  models/  logs/  temp/
 ├── cluster/
 └── archive/                     # Deprecated code, old models, previous versions
 ```
@@ -211,10 +235,12 @@ latexmk -pdf paper/main.tex
 
 | | Section | Contains |
 |---|---------|----------|
+| | Statement of Relevance | |
 | 1 | Introduction | |
 | 2 | Methods | Task · Participants · Mouse Tracking · Mixed-Effects and Hierarchical Regressions · Computational Model · Model Fitting · Out-of-Sample Simulations |
-| 3 | Results | Basic Psychometrics · Fixation Process · Option-Level Attention · Attribute-Level Attention · Bayesian Sequential Sampling |
+| 3 | Results | Basic Psychometrics · Dwell Properties · Option-Level Attention · Attribute-Level Attention · Bayesian Sequential Sampling |
 | 4 | Discussion | |
+| | Transparency | Open practices (both studies preregistered on AsPredicted) · data and code availability |
 | A | Appendices | Computing Choice Probability · Parameter Recovery · Model Fitting Details · Regressions · Range Sensitivity Simulations · Range Sensitivity by Attribute Type · Bayesian Model Variants · Attention Weights by Study · Attention Weights from Pre-Registered Model |
 
 The body follows an explore/confirm split after Eum et al. (2023): Study 1 was used to settle on the analyses, and Study 2 — preregistered, 60 trials in three blocks of 20 rather than 30 interleaved — replays them as confirmation.
